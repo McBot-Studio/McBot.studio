@@ -109,7 +109,7 @@ jobs:
           cp sync.log out/ 2>/dev/null || true
           { [ -f test.log ] && grep -E "FAIL|✗|×|Error|error TS" test.log build.log | head -n 80; } > out/failures.log || true
       - if: steps.find.outputs.current == 'false'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: engine-sync
           path: out/
@@ -127,7 +127,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: engine-sync
           path: ${{ runner.temp }}/sync
