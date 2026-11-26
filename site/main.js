@@ -436,20 +436,55 @@ document.documentElement.classList.add("js");
     }, { threshold: 0.5 }).observe(count);
   }
 
-  /* ---------- the crew at the end: they bob, look at the cursor, and smile when touched ---------- */
-  const parade = $("[data-parade]");
-  if (parade && F) {
+  /* ---------- the crew along the footer's edge: big, cut off by its line; touched, they rise and smile ---------- */
+  const crew = $("[data-crew]");
+  if (crew && F) {
     const CAST = [["fries", 6], ["cup", 2], ["cone", 9], ["burger", 8], ["pizza", 7], ["donut", 3], ["onigiri", 4], ["cookie", 1]];
-    const size = matchMedia("(max-width: 560px)").matches ? 40 : 56;
+    const size = matchMedia("(max-width: 700px)").matches ? 118 : 196;
     CAST.forEach(([food, tone], i) => {
       const el = document.createElement("span");
-      el.style.setProperty("--delay", `${(-i * 0.3).toFixed(2)}s`);
-      const render = (exp) => { el.innerHTML = F.foodSvg({ seed: food, food, tone, size, expression: exp, uid: `parade${i}`, title: "" }); };
+      el.style.setProperty("--delay", `${(-i * 0.4).toFixed(2)}s`);
+      const render = (exp) => { el.innerHTML = F.foodSvg({ seed: food, food, tone, size, expression: exp, uid: `crew${i}`, title: "" }); };
       render("idle");
       let timer = 0;
-      el.addEventListener("pointerenter", () => { render("happy"); clearTimeout(timer); timer = setTimeout(() => render("idle"), 1100); });
-      parade.appendChild(el);
+      el.addEventListener("pointerenter", () => { render("happy"); clearTimeout(timer); });
+      el.addEventListener("pointerleave", () => { timer = setTimeout(() => render("idle"), 700); });
+      crew.appendChild(el);
     });
+  }
+
+  /* ---------- the menu bar: menus open on hover (a mouse) or a click (touch, keyboard); the burger on phones ---------- */
+  const navEl = $("[data-nav]");
+  const drops = $$("[data-drop]");
+  const setOpen = (d, on) => { d.classList.toggle("open", on); $("button", d)?.setAttribute("aria-expanded", String(on)); };
+  const closeDrops = (except) => drops.forEach((d) => { if (d !== except) setOpen(d, false); });
+  const fine = matchMedia("(hover: hover) and (min-width: 1001px)");
+  drops.forEach((d) => {
+    const btn = $("button", d);
+    let t = 0;
+    btn.addEventListener("click", (e) => { e.stopPropagation(); const on = !d.classList.contains("open"); closeDrops(d); setOpen(d, on); });
+    d.addEventListener("pointerenter", () => { if (!fine.matches) return; clearTimeout(t); closeDrops(d); setOpen(d, true); });
+    d.addEventListener("pointerleave", () => { if (!fine.matches) return; t = setTimeout(() => setOpen(d, false), 160); });
+    $$("a", d).forEach((a) => a.addEventListener("click", () => { setOpen(d, false); navEl?.classList.toggle("open", false); }));
+  });
+  document.addEventListener("click", (e) => { if (!e.target.closest?.("[data-drop]")) closeDrops(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDrops(); navEl?.classList.toggle("open", false); } });
+  const burger = $("[data-burger]");
+  burger?.addEventListener("click", () => { const on = !navEl.classList.contains("open"); navEl.classList.toggle("open", on); burger.setAttribute("aria-expanded", String(on)); });
+  $$(".nav-menu > a").forEach((a) => a.addEventListener("click", () => navEl?.classList.toggle("open", false)));
+
+  /* ---------- liquid metal: the light follows the pointer, and brightens as it comes near ---------- */
+  const metals = $$("[data-metal]");
+  if (metals.length && !reduce) {
+    addEventListener("pointermove", (e) => {
+      for (const m of metals) {
+        const r = m.getBoundingClientRect();
+        m.style.setProperty("--mx", `${e.clientX - r.left}px`);
+        m.style.setProperty("--my", `${e.clientY - r.top}px`);
+        const dx = Math.max(r.left - e.clientX, 0, e.clientX - r.right), dy = Math.max(r.top - e.clientY, 0, e.clientY - r.bottom);
+        m.classList.toggle("near", Math.hypot(dx, dy) < 90);
+      }
+    }, { passive: true });
   }
 
   /* ---------- the split download button ---------- */
@@ -521,4 +556,95 @@ document.documentElement.classList.add("js");
     .then((r) => (r.ok ? r.json() : null))
     .then((rel) => { if (rel && rel.assets) render(rel); })
     .catch(() => { /* offline or blocked: the cards keep "Coming soon" */ });
+})();
+
+/* ---------- AI cursors: three of the team at work on the hero, as on the app's shared board. Each
+   walks to a real element, selects, hovers, clicks or leaves a note, then moves on. Desktop only,
+   only while the hero is on screen; reduced motion shows none. ---------- */
+(() => {
+  const layer = document.querySelector("[data-ai]");
+  const F = window.McBotFoods;
+  if (!layer || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const stage = layer.parentElement;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const arrow = (c) => `<svg class="arrow" width="20" height="22" viewBox="0 0 20 22"><path d="M2 1.5 17.5 11l-7 1.4-3.6 6.6z" fill="${c}" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
+  const TEAM = [
+    { name: "Researcher", c: "#7c5cff" },
+    { name: "Writer", c: "#ff7a45" },
+    { name: "Designer", c: "#1fb57a" },
+  ];
+  const q = (s) => stage.querySelector(s);
+  // What each one does, over and over: [target, action, words]
+  const PLANS = [
+    [[".hero-title", "select", "Reading the headline"], [".hero-win .w-thread", "note", "Found 3 sources"], ["[data-demo]", "hover", "Trying the demo"], [".hero-meta", "note", "Checked: free, MIT"]],
+    [[".hero-lede", "select", "Drafting a reply…"], [".hero-win .w-compose", "click", "Typing in chat"], [".hero-title", "note", "Shorter? Keeping it."]],
+    [["[data-dl-primary]", "hover", "Polishing the button"], ["[data-dl-primary]", "click", ""], [".bot", "note", "Logo looks great"], [".hero-win .win-bar", "select", "Aligning the window"]],
+  ];
+  const cursors = TEAM.map((m, i) => {
+    const el = document.createElement("div");
+    el.className = "aic";
+    el.style.setProperty("--c", m.c);
+    const face = F ? F.foodSvg({ seed: `agent:${m.name}`, size: 18, expression: "happy", uid: `aic${i}`, title: "" }) : "";
+    el.innerHTML = `${arrow(m.c)}<span class="ping"></span><span class="tag">${face}${m.name}</span><span class="say"></span>`;
+    layer.appendChild(el);
+    return { el, plan: PLANS[i], x: 0, y: 0 };
+  });
+  let live = false;
+  // Phones and narrow windows get no cursors (the layer is hidden there too).
+  const narrow = matchMedia("(max-width: 900px)");
+  new IntersectionObserver(([e]) => { live = e.isIntersecting; }, { threshold: 0.15 }).observe(stage);
+
+  const at = (sel) => {
+    const t = q(sel);
+    if (!t) return null;
+    const r = t.getBoundingClientRect(), s = stage.getBoundingClientRect();
+    if (!r.width) return null;
+    return { t, x: r.left - s.left + r.width * (0.3 + Math.random() * 0.4), y: r.top - s.top + Math.min(r.height * (0.35 + Math.random() * 0.3), 140) };
+  };
+  const move = (c, x, y) => {
+    const d = Math.hypot(x - c.x, y - c.y);
+    const t = Math.min(1.6, 0.5 + d / 900);
+    c.el.style.setProperty("--t", `${t}s`);
+    c.el.style.setProperty("--x", `${x}px`);
+    c.el.style.setProperty("--y", `${y}px`);
+    c.x = x; c.y = y;
+    return sleep(t * 1000 + 120);
+  };
+  const say = async (c, text, ms) => {
+    if (!text) { await sleep(500); return; }
+    c.el.querySelector(".say").textContent = text;
+    c.el.classList.toggle("saying", true);
+    await sleep(ms);
+    c.el.classList.toggle("saying", false);
+  };
+  async function run(c, i) {
+    const s = stage.getBoundingClientRect();
+    c.x = i % 2 ? s.width + 40 : -40;
+    c.y = 200 + i * 120;
+    c.el.style.setProperty("--t", "0s");
+    c.el.style.setProperty("--x", `${c.x}px`);
+    c.el.style.setProperty("--y", `${c.y}px`);
+    await sleep(900 + i * 1300);
+    for (let n = 0; ; n++) {
+      if (!live || document.hidden || narrow.matches) { await sleep(800); continue; }
+      const [sel, act, text] = c.plan[n % c.plan.length];
+      const p = at(sel);
+      if (!p) { await sleep(600); continue; }
+      await move(c, p.x, p.y);
+      p.t.style.setProperty("--c", TEAM[i].c);
+      if (act === "select" || act === "hover") {
+        const cls = act === "select" ? "ai-sel" : "ai-hover";
+        p.t.classList.toggle(cls, true);
+        await say(c, text, act === "select" ? 1700 : 1200);
+        p.t.classList.toggle(cls, false);
+      } else if (act === "click") {
+        c.el.classList.toggle("click", false);
+        void c.el.offsetWidth;
+        c.el.classList.toggle("click", true);
+        await say(c, text, 1100);
+      } else await say(c, text, 1700);
+      await sleep(500 + Math.random() * 900);
+    }
+  }
+  cursors.forEach((c, i) => void run(c, i));
 })();

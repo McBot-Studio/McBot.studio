@@ -726,8 +726,16 @@ MCBOT_E2E=1 npm test   also run the real end-to-end test on McBot's own Hermes
   toward the cursor and makes it blink; a poke makes it happy. The bots in the page's windows and
   the crew at the end use `site/foods.js`. Clean and flat like a Mac page: system font, black and
   gray surfaces, white buttons; near-black cards with hairline borders, a floating nav, big tight
-  type (Raycast-class finish, never its look or trade dress). Owner's rule: no gradients, glows,
-  dotted grids or status dots, no gray boxes behind brand logos, and no scroll-jacking. The copy
+  type at regular-to-medium weights (500 for headlines, never bold; owner's ask, x.ai-like lightness, never its look
+  or trade dress). Owner's rule: no gradients, glows, dotted grids or status dots, no gray boxes behind brand logos,
+  and no scroll-jacking, with one exception the owner asked for: the **liquid metal** ring around the Download
+  buttons (`.metal`, a chrome conic gradient through the `#liquid` SVG turbulence filter, flowing, brighter and faster
+  under the pointer; the button inside is dark metal). The menu bar is a full-width bar (`.nav-bar`: Product and
+  Resources menus that open on hover or click, Compare, FAQ, News; GitHub and Download on the right; a burger
+  under 1000 px). **AI cursors** (end of `site/main.js`): three of the team (Researcher, Writer, Designer, each with its
+  bot) walk to real hero elements and select, hover, click or leave a note, only while the hero is on screen, never
+  on phones or with reduced motion. The footer opens with the **crew**: eight big bots (196 px) cut off by its top
+  line, rising and smiling when touched. The copy
   sells three reasons in plain words (no filler, no placeholder company names): yours (on your
   computer, private, never locked in), any model ("Switch models, not apps") and the harness you
   can see and change by drawing; then what a working team needs, a comparison, three steps, a FAQ
