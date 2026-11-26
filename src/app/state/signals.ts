@@ -1,0 +1,98 @@
+import { useEffect, useRef } from "react";
+import type { TaskView } from "../../contracts/api";
+import type { AgentNode } from "../../contracts/graph";
+import type { RunSummary } from "../../contracts/run";
+import { attentionCount } from "../lib/attention";
+import { notify, setAttention, setIslandActive, islandBridge } from "../lib/desktop";
+import { islandStateOf, type IslandAct, type IslandState } from "../lib/islandBridge";
+import { DEMO, REMOTE, engine } from "../lib/engine";
+import { REPO_URL, markStarAsked, shouldAskForStar } from "../lib/links";
+import { openExternal } from "../lib/open";
+import { runError } from "../lib/runError";
+import { useApp } from "./store";
+
+/**
+ * Keep the menu bar count current, and notify when an agent finishes or a task changes in a way
+ * that needs the person. Only changes seen while the app runs notify: the first look is a baseline.
+ */
+export function useSignals(tasks: readonly TaskView[] | null, runs: Record<string, RunSummary>, drift: number | null, agents: readonly AgentNode[]): void {
+  const seenRuns = useRef<Map<string, string> | null>(null);
+  const seenTasks = useRef<Map<string, string> | null>(null);
+  const nameOf = (profile: string | null) => {
+    const a = agents.find((x) => x.data.name === profile);
+    return a ? a.data.displayName || a.data.name : profile ?? "An agent";
+  };
+
+  useEffect(() => {
+    void setAttention(attentionCount(tasks ?? [], Object.values(runs), drift));
+  }, [tasks, runs, drift]);
+
+  // The floating island: what to show while McBot is hidden, and its buttons.
+  const island = useRef<IslandState>({ mode: "rest", text: "McBot", count: 0 });
+  const push = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    const list = Object.values(runs);
+    island.current = islandStateOf(list, (r) => nameOf(r.profile), attentionCount(tasks ?? [], list, drift));
+    void setIslandActive(island.current.mode !== "rest");
+    push.current();
+  }, [tasks, runs, drift]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    let live = true;
+    let stop = () => undefined as void;
+    const onAct = (a: IslandAct) => {
+      if (a.type === "answer") void engine.answerRun(a.runId, a.choice).catch(() => undefined);
+      else void import("../lib/desktop").then((d) => (a.type === "open" ? d.showApp() : d.toggleApp()));
+    };
+    void islandBridge(() => island.current, onAct).then((b) => { if (!live) { b.stop(); return; } push.current = b.push; stop = b.stop; });
+    return () => { live = false; stop(); };
+  }, []);
+
+  // After a few good answers, McBot asks once for a star (lib/links.ts).
+  useEffect(() => {
+    const good = Object.values(runs).filter((r) => r.status === "succeeded").length;
+    if (!shouldAskForStar(good, !REMOTE && !DEMO)) return;
+    markStarAsked();
+    useApp.getState().toast({ kind: "info", text: "Like McBot? A star on GitHub helps others find it", action: { label: "Star", run: () => void openExternal(REPO_URL) } });
+  }, [runs]);
+
+  // A run that starts asking before a risky action: always worth a notification.
+  const asked = useRef(new Set<string>());
+  useEffect(() => {
+    for (const r of Object.values(runs)) {
+      if (!r.approval || asked.current.has(r.approval.promptId)) continue;
+      asked.current.add(r.approval.promptId);
+      void notify(`${nameOf(r.profile)} asks before acting`, `${r.approval.description}: ${r.approval.command}`);
+    }
+    // …and when it stops to ask the person something (it waits a minute or so, then goes on).
+    for (const r of Object.values(runs)) {
+      if (!r.question || asked.current.has(r.question.promptId)) continue;
+      asked.current.add(r.question.promptId);
+      void notify(`${nameOf(r.profile)} asks you`, r.question.question);
+    }
+  }, [runs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const before = seenRuns.current;
+    seenRuns.current = new Map(Object.values(runs).map((r) => [r.runId, r.status]));
+    if (!before) return;
+    for (const r of Object.values(runs)) {
+      if (before.get(r.runId) !== "running" || r.status === "running") continue;
+      if (r.status === "succeeded") void notify(`${nameOf(r.profile)} answered`, r.text.split("\n")[0] || r.prompt);
+      if (r.status === "failed") void notify(`${nameOf(r.profile)} failed`, r.error ? runError(r.error) : r.prompt);
+    }
+  }, [runs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (!tasks) return;
+    const before = seenTasks.current;
+    seenTasks.current = new Map(tasks.map((t) => [t.id, t.status]));
+    if (!before) return;
+    for (const t of tasks) {
+      const was = before.get(t.id);
+      if (was === t.status) continue;
+      if (t.status === "review") void notify(`${nameOf(t.assignee)} asks for a review`, t.title);
+      else if (t.status === "blocked") void notify(`${nameOf(t.assignee)} is blocked`, t.error ?? t.title);
+      else if (t.status === "done" && was) void notify(`${nameOf(t.assignee)} finished a task`, t.title);
+    }
+  }, [tasks]); // eslint-disable-line react-hooks/exhaustive-deps
+}

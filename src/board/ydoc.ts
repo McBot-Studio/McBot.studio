@@ -1,0 +1,251 @@
+/**
+ * The shared board as a Yjs document. Used by the relay (persistence, compile)
+ * and by every window (editing), so both read the graph the same way.
+ *
+ *   meta   Y.Map  schema, id, name
+ *   nodes  Y.Map  nodeId -> Y.Map { kind, position, data: Y.Map<field, json> }
+ *   edges  Y.Map  edgeId -> { id, source, target, order }
+ *   notes  Y.Map  noteId -> Y.Map { text, color, position, pinned, author, at }  (sticky notes)
+ *   messages Y.Map messageId -> { id, author, color, agent, text, at }  (team chat)
+ *   frames Y.Map  frameId -> Y.Map { title, color, position, size }  (areas grouping blocks)
+ *   brief  Y.Map  field -> text  (what every agent knows about the business; compiled into SOUL.md)
+ *   docs   Y.Map  docId -> { id, name, text, bytes, by, at }  (documents for the agents; compiled as a skill)
+ *
+ * Everything is keyed by id (never a Y.Array), so a relay restarted from the
+ * JSON file and a window still holding the old document merge without
+ * duplicating anything. Node fields are separate map entries, so two people
+ * editing different fields of one node both keep their change.
+ */
+import * as Y from "yjs";
+import { BRIEF_FIELDS, GRAPH_SCHEMA, MESSAGES_KEPT, briefHasContent, emptyBrief, type Brief, type Doc, type Frame, type Graph, type GraphEdge, type GraphNode, type Message, type Note } from "../contracts/graph";
+
+type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
+
+export function boardMaps(doc: Y.Doc) {
+  return {
+    meta: doc.getMap<Json>("meta"),
+    nodes: doc.getMap<Y.Map<unknown>>("nodes"),
+    edges: doc.getMap<GraphEdge>("edges"),
+    notes: doc.getMap<Y.Map<unknown>>("notes"),
+    messages: doc.getMap<Message>("messages"),
+    frames: doc.getMap<Y.Map<unknown>>("frames"),
+    brief: doc.getMap<string>("brief"),
+    docs: doc.getMap<Doc>("docs"),
+  };
+}
+
+function nodeToY(node: GraphNode): Y.Map<unknown> {
+  const m = new Y.Map<unknown>();
+  m.set("kind", node.kind);
+  m.set("position", { x: node.position.x, y: node.position.y });
+  const data = new Y.Map<unknown>();
+  for (const [k, v] of Object.entries(node.data)) data.set(k, structuredClone(v));
+  m.set("data", data);
+  return m;
+}
+
+function nodeFromY(id: string, m: Y.Map<unknown>): GraphNode {
+  const data = m.get("data");
+  return {
+    id,
+    kind: m.get("kind"),
+    position: m.get("position") ?? { x: 0, y: 0 },
+    data: data instanceof Y.Map ? data.toJSON() : {},
+  } as GraphNode;
+}
+
+function noteToY(note: Note): Y.Map<unknown> {
+  const m = new Y.Map<unknown>();
+  for (const [k, v] of Object.entries(note)) if (k !== "id") m.set(k, structuredClone(v));
+  return m;
+}
+
+function noteFromY(id: string, m: Y.Map<unknown>): Note {
+  const j = m.toJSON() as Partial<Note>;
+  return { id, text: j.text ?? "", color: j.color ?? "yellow", position: j.position ?? { x: 0, y: 0 }, pinned: j.pinned ?? false, author: j.author ?? "", at: j.at ?? 0 };
+}
+
+function frameToY(frame: Frame): Y.Map<unknown> {
+  const m = new Y.Map<unknown>();
+  for (const [k, v] of Object.entries(frame)) if (k !== "id") m.set(k, structuredClone(v));
+  return m;
+}
+
+function frameFromY(id: string, m: Y.Map<unknown>): Frame {
+  const j = m.toJSON() as Partial<Frame>;
+  return { id, title: j.title ?? "", color: j.color ?? "blue", position: j.position ?? { x: 0, y: 0 }, size: j.size ?? { width: 420, height: 300 } };
+}
+
+/** Read the graph out of the doc (unvalidated: the compiler validates). Sorted by id. */
+export function graphFromDoc(doc: Y.Doc): Graph {
+  const { meta, nodes, edges, notes, messages, frames, brief, docs } = boardMaps(doc);
+  const byId = <T extends { id: string }>(a: T, b: T) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+  const graph: Graph = {
+    schema: GRAPH_SCHEMA,
+    id: String(meta.get("id") ?? ""),
+    name: String(meta.get("name") ?? ""),
+    nodes: [...nodes.entries()].map(([id, m]) => nodeFromY(id, m)).sort(byId),
+    edges: [...edges.values()].map((e) => ({ ...e })).sort(byId),
+  };
+  // Only boards that have notes carry the field, so every other board reads exactly as before.
+  if (notes.size) graph.notes = [...notes.entries()].map(([id, m]) => noteFromY(id, m)).sort(byId);
+  if (frames.size) graph.frames = [...frames.entries()].map(([id, m]) => frameFromY(id, m)).sort(byId);
+  if (messages.size) graph.messages = [...messages.values()].map((m) => ({ ...m })).sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : 1)).slice(-MESSAGES_KEPT);
+  const b = briefFromMap(brief);
+  if (briefHasContent(b)) graph.brief = b;
+  if (docs.size) graph.docs = [...docs.values()].map((d) => ({ ...d })).sort(byId);
+  return graph;
+}
+
+function briefFromMap(m: Y.Map<string>): Brief {
+  const b = emptyBrief();
+  for (const k of BRIEF_FIELDS) {
+    const v = m.get(k);
+    if (typeof v === "string") b[k] = v;
+  }
+  return b;
+}
+
+/** Replace the doc's content with `graph` in one transaction. */
+export function loadGraphIntoDoc(doc: Y.Doc, graph: Graph): void {
+  const { meta, nodes, edges, notes, messages, frames, brief, docs } = boardMaps(doc);
+  doc.transact(() => {
+    for (const id of [...docs.keys()]) if (!(graph.docs ?? []).some((d) => d.id === id)) docs.delete(id);
+    for (const d of graph.docs ?? []) docs.set(d.id, { ...d });
+    for (const k of BRIEF_FIELDS) {
+      const v = graph.brief?.[k] ?? "";
+      if (v) brief.set(k, v);
+      else if (brief.has(k)) brief.delete(k);
+    }
+    for (const id of [...frames.keys()]) if (!(graph.frames ?? []).some((f) => f.id === id)) frames.delete(id);
+    for (const f of graph.frames ?? []) frames.set(f.id, frameToY(f));
+    for (const id of [...messages.keys()]) if (!(graph.messages ?? []).some((m) => m.id === id)) messages.delete(id);
+    for (const m of graph.messages ?? []) messages.set(m.id, { ...m });
+    for (const id of [...notes.keys()]) if (!(graph.notes ?? []).some((n) => n.id === id)) notes.delete(id);
+    for (const n of graph.notes ?? []) notes.set(n.id, noteToY(n));
+    meta.set("schema", GRAPH_SCHEMA);
+    meta.set("id", graph.id);
+    meta.set("name", graph.name);
+    for (const id of [...nodes.keys()]) if (!graph.nodes.some((n) => n.id === id)) nodes.delete(id);
+    for (const id of [...edges.keys()]) if (!graph.edges.some((e) => e.id === id)) edges.delete(id);
+    for (const n of graph.nodes) nodes.set(n.id, nodeToY(n));
+    for (const e of graph.edges) edges.set(e.id, { ...e });
+  });
+}
+
+/**
+ * Put back a harness version's blocks and wires (src/harness/versions.ts), in one transaction so one
+ * ⌘Z takes it back; notes, frames, chat and the board's name stay as they are.
+ */
+export function restoreHarness(doc: Y.Doc, graph: Pick<Graph, "nodes" | "edges">): void {
+  const { nodes, edges } = boardMaps(doc);
+  doc.transact(() => {
+    for (const id of [...edges.keys()]) if (!graph.edges.some((e) => e.id === id)) edges.delete(id);
+    for (const id of [...nodes.keys()]) if (!graph.nodes.some((n) => n.id === id)) nodes.delete(id);
+    for (const n of graph.nodes) nodes.set(n.id, nodeToY(n));
+    for (const e of graph.edges) edges.set(e.id, { ...e });
+  });
+}
+
+// ---- edits used by the UI (each one transaction, origin = local user) ----
+
+export function addNode(doc: Y.Doc, node: GraphNode): void {
+  boardMaps(doc).nodes.set(node.id, nodeToY(node));
+}
+
+export function moveNode(doc: Y.Doc, id: string, position: { x: number; y: number }): void {
+  boardMaps(doc).nodes.get(id)?.set("position", { x: Math.round(position.x), y: Math.round(position.y) });
+}
+
+export function setNodeField(doc: Y.Doc, id: string, field: string, value: unknown): void {
+  const data = boardMaps(doc).nodes.get(id)?.get("data");
+  if (!(data instanceof Y.Map)) return;
+  // `undefined` takes an optional field off the block (an unset field is absent, not null).
+  if (value === undefined) data.delete(field);
+  else data.set(field, structuredClone(value));
+}
+
+export function removeNodes(doc: Y.Doc, ids: readonly string[]): void {
+  const { nodes, edges } = boardMaps(doc);
+  doc.transact(() => {
+    for (const id of ids) nodes.delete(id);
+    for (const [eid, e] of [...edges.entries()]) if (ids.includes(e.source) || ids.includes(e.target)) edges.delete(eid);
+  });
+}
+
+export function addEdge(doc: Y.Doc, edge: GraphEdge): void {
+  boardMaps(doc).edges.set(edge.id, { ...edge });
+}
+
+export function updateEdge(doc: Y.Doc, id: string, patch: Partial<Omit<GraphEdge, "id">>): void {
+  const { edges } = boardMaps(doc);
+  const e = edges.get(id);
+  if (e) edges.set(id, { ...e, ...patch });
+}
+
+export function removeEdges(doc: Y.Doc, ids: readonly string[]): void {
+  const { edges } = boardMaps(doc);
+  doc.transact(() => ids.forEach((id) => edges.delete(id)));
+}
+
+/** One field of the board's brief (an empty text takes it off). */
+export function setBriefField(doc: Y.Doc, field: keyof Brief, value: string): void {
+  const { brief } = boardMaps(doc);
+  if (value) brief.set(field, value);
+  else brief.delete(field);
+}
+
+export function renameBoard(doc: Y.Doc, name: string): void {
+  boardMaps(doc).meta.set("name", name);
+}
+
+// ---- sticky notes ----
+
+export function addNote(doc: Y.Doc, note: Note): void {
+  boardMaps(doc).notes.set(note.id, noteToY(note));
+}
+
+export function setNoteField<K extends keyof Omit<Note, "id">>(doc: Y.Doc, id: string, field: K, value: Note[K]): void {
+  boardMaps(doc).notes.get(id)?.set(field, structuredClone(value));
+}
+
+export function removeNote(doc: Y.Doc, id: string): void {
+  boardMaps(doc).notes.delete(id);
+}
+
+/** Post to the board's team chat; the oldest messages drop off past MESSAGES_KEPT. */
+export function addMessage(doc: Y.Doc, message: Message): void {
+  const { messages } = boardMaps(doc);
+  doc.transact(() => {
+    messages.set(message.id, { ...message });
+    if (messages.size > MESSAGES_KEPT) {
+      const old = [...messages.values()].sort((a, b) => a.at - b.at).slice(0, messages.size - MESSAGES_KEPT);
+      for (const m of old) messages.delete(m.id);
+    }
+  });
+}
+
+// ---- documents (Knowledge → Business) ----
+
+/** Add a document; one with the same id is replaced. */
+export function addDoc(doc: Y.Doc, d: Doc): void {
+  boardMaps(doc).docs.set(d.id, { ...d });
+}
+
+export function removeDoc(doc: Y.Doc, id: string): void {
+  boardMaps(doc).docs.delete(id);
+}
+
+// ---- frames ----
+
+export function addFrame(doc: Y.Doc, frame: Frame): void {
+  boardMaps(doc).frames.set(frame.id, frameToY(frame));
+}
+
+export function setFrameField<K extends keyof Omit<Frame, "id">>(doc: Y.Doc, id: string, field: K, value: Frame[K]): void {
+  boardMaps(doc).frames.get(id)?.set(field, structuredClone(value));
+}
+
+export function removeFrame(doc: Y.Doc, id: string): void {
+  boardMaps(doc).frames.delete(id);
+}

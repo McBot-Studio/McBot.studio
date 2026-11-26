@@ -1,0 +1,423 @@
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import WebSocket from "ws";
+import { WebsocketProvider } from "y-websocket";
+import * as Y from "yjs";
+import { addDoc, addEdge, addNode, graphFromDoc, setNodeField } from "../src/board/ydoc";
+import type { CompileResponse, TaskDetail, TasksView, TaskView } from "../src/contracts/api";
+import type { RunEvent, RunSummary } from "../src/contracts/run";
+import { startStubLlm, type StubLlm } from "../test/stub-llm/server";
+import { startStubTelegram, type StubTelegram } from "../test/stub-telegram/server";
+import { findHermes, stopGateway } from "./hermes";
+import { startEngine, type Engine } from "./server";
+
+const ORIGIN = "http://localhost:5173";
+let engine: Engine;
+let stub: StubLlm;
+let telegram: StubTelegram | null = null;
+let workspace: string;
+
+beforeAll(async () => {
+  workspace = mkdtempSync(join(tmpdir(), "mcbot-engine-"));
+  stub = await startStubLlm();
+  engine = await startEngine({ workspace, hermesHome: join(workspace, "hermes"), managedRoot: true, port: 0, host: "127.0.0.1", allowedOrigins: [ORIGIN] });
+  await engine.relay.create("team", "Team board");
+});
+afterAll(async () => {
+  // A chat app keeps the gateway running on purpose; a test must not leave one behind.
+  const bin = telegram ? await findHermes() : null;
+  if (bin) await stopGateway(bin, join(workspace, "hermes"));
+  await telegram?.close();
+  await engine?.close();
+  await stub?.close();
+});
+
+const api = async <T>(path: string, init: RequestInit = {}): Promise<{ status: number; body: T }> => {
+  const res = await fetch(`${engine.url}${path}`, { ...init, headers: { origin: ORIGIN, "content-type": "application/json", ...(init.headers ?? {}) } });
+  return { status: res.status, body: (await res.json()) as T };
+};
+
+function client(): { doc: Y.Doc; provider: WebsocketProvider } {
+  const doc = new Y.Doc();
+  // disableBc: Node 22 has a global BroadcastChannel, which would let two in-process
+  // clients sync with each other directly and hide a broken relay.
+  const provider = new WebsocketProvider(`${engine.url.replace("http", "ws")}/board`, "team", doc, {
+    disableBc: true,
+    WebSocketPolyfill: class extends WebSocket {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols, { headers: { origin: ORIGIN } });
+      }
+    } as unknown as typeof globalThis.WebSocket,
+  });
+  return { doc, provider };
+}
+
+const untilAsync = async (cond: () => Promise<boolean>, ms: number) => {
+  const end = Date.now() + ms;
+  while (!(await cond())) {
+    if (Date.now() > end) throw new Error("timed out");
+    await new Promise((r) => setTimeout(r, 500));
+  }
+};
+
+const until = async (cond: () => boolean, ms = 5000) => {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("timed out");
+    await new Promise((r) => setTimeout(r, 20));
+  }
+};
+
+describe("engine", () => {
+  it("rejects browser origins it does not know (no drive-by compiles or runs)", async () => {
+    const res = await fetch(`${engine.url}/api/health`, { headers: { origin: "https://evil.example" } });
+    expect(res.status).toBe(403);
+    const ok = await api<{ ok: boolean }>("/api/health");
+    expect(ok.body.ok).toBe(true);
+  });
+
+  it("shares one board between two clients live, with presence, and persists it as JSON", async () => {
+    const a = client();
+    const b = client();
+    await until(() => a.provider.synced && b.provider.synced);
+
+    a.provider.awareness.setLocalStateField("user", { name: "Ada", color: "#0a84ff" });
+    a.provider.awareness.setLocalStateField("cursor", { x: 10, y: 20 });
+    addNode(a.doc, { id: "n-agent", kind: "agent", position: { x: 0, y: 0 }, data: { name: "triage", displayName: "Triage", description: "Routes tickets.", soul: "", skills: [], capabilities: null } });
+    addNode(a.doc, { id: "n-model", kind: "model", position: { x: -300, y: 0 }, data: { name: "local", label: "Local", endpoint: "local", baseUrl: stub.url, model: "stub-model", apiKeyEnv: "", pricing: { inputPerMTok: 0.1, outputPerMTok: 0.2 } } });
+    addEdge(a.doc, { id: "e1", source: "n-agent", target: "n-model", order: 0 });
+
+    await until(() => graphFromDoc(b.doc).nodes.length === 2 && graphFromDoc(b.doc).edges.length === 1);
+    await until(() => [...b.provider.awareness.getStates().values()].some((s) => s.user?.name === "Ada" && s.cursor?.x === 10));
+
+    setNodeField(b.doc, "n-agent", "displayName", "Triage desk");
+    await until(() => (graphFromDoc(a.doc).nodes.find((n) => n.id === "n-agent")?.data as { displayName?: string } | undefined)?.displayName === "Triage desk");
+
+    await engine.relay.flush();
+    const saved = JSON.parse(readFileSync(join(workspace, "boards/team.json"), "utf8"));
+    expect(saved.nodes.map((n: { id: string }) => n.id)).toEqual(["n-agent", "n-model"]);
+    a.provider.destroy();
+    b.provider.destroy();
+  });
+
+  it("compiles the live shared board into a Hermes profile on disk", async () => {
+    const { body } = await api<CompileResponse>("/api/compile", { method: "POST", body: JSON.stringify({ boardId: "team" }) });
+    expect(body.ok).toBe(true);
+    if (!body.ok) return;
+    expect(body.report.changes.map((c) => [c.path, c.status])).toEqual([
+      [".mcbot/manifest.json", "added"],
+      ["profiles/triage/SOUL.md", "added"],
+      ["profiles/triage/config.yaml", "added"],
+      ["profiles/triage/profile.yaml", "added"],
+      ["profiles/triage/skills/mcbot/mcbot-studio/SKILL.md", "added"],
+    ]);
+    expect(body.gateway).toBe("restart-pending");
+    // The agent knows where it works, and has McBot's guide (src/compile/mcbotGuide.ts).
+    expect(readFileSync(join(workspace, "hermes/profiles/triage/SOUL.md"), "utf8")).toContain("## Where you work");
+    expect(existsSync(join(workspace, "hermes/profiles/triage/skills/mcbot/mcbot-studio/SKILL.md"))).toBe(true);
+    const cfg = readFileSync(join(workspace, "hermes/profiles/triage/config.yaml"), "utf8");
+    expect(cfg).toContain(`api: ${stub.url}\n`);
+    expect(existsSync(join(workspace, "hermes/profiles/triage/skills"))).toBe(true);
+
+    const again = await api<CompileResponse>("/api/compile?boardId=team");
+    expect(again.body.ok && again.body.report.changes.every((c) => c.status === "unchanged")).toBe(true);
+  });
+
+  // MCBOT_HERMES_BIN: a given Hermes; MCBOT_E2E=1: McBot's own (hermes/, after `npm run engine:setup`).
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("runs the compiled agent through real Hermes and records events, memory and cost", async () => {
+    const { body } = await api<{ runId: string }>("/api/runs", { method: "POST", body: JSON.stringify({ boardId: "team", agentNodeId: "n-agent", prompt: "remember: Tickets about billing go to Sam" }) });
+    expect(body.runId).toMatch(/^run_/);
+    let events: RunEvent[] = [];
+    const end = Date.now() + 240_000;
+    while (Date.now() < end) {
+      events = (await api<RunEvent[]>(`/api/runs/${body.runId}`)).body;
+      if (events.some((e) => e.type === "run.cost") || events.some((e) => e.type === "run.finished" && e.status !== "succeeded")) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    const finished = events.find((e) => e.type === "run.finished");
+    expect(finished, JSON.stringify(events.filter((e) => e.type !== "run.log").slice(-5))).toMatchObject({ status: "succeeded", exitCode: 0, text: "Saved to memory: Tickets about billing go to Sam" });
+    expect(events.find((e) => e.type === "run.tool.started")).toMatchObject({ tool: "memory" });
+    expect(events.find((e) => e.type === "run.cost")).toMatchObject({ model: "stub-model", provider: "custom", costStatus: "unknown", estimatedUsd: expect.any(Number) });
+
+    const memory = await api<{ profile: string; memory: { entries: string[] } }[]>("/api/memory?boardId=team");
+    expect(memory.body[0]!.memory.entries).toContain("Tickets about billing go to Sam");
+    const cost = await api<{ totals: { sessions: number; successfulRuns: number } }>("/api/cost?boardId=team");
+    expect(cost.body.totals).toMatchObject({ sessions: 1, successfulRuns: 1 });
+    const runs = await api<RunSummary[]>("/api/runs?boardId=team");
+    expect(runs.body[0]).toMatchObject({ status: "succeeded", profile: "triage" });
+  }, 300_000);
+
+  // Hermes' kanban: a task created in McBot goes to the agent through the gateway's dispatcher.
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("gives the agent a task; Hermes hands it over, the agent finishes it, and a person comments and archives it", async () => {
+    const created = await api<TaskView>("/api/tasks", { method: "POST", body: JSON.stringify({
+      boardId: "team", title: "Sort the billing tickets", body: 'call:kanban_complete {"summary":"Sorted 3 tickets"}', assignee: "triage", by: "Ada",
+    }) });
+    expect(created.status, JSON.stringify(created.body)).toBe(200);
+    expect(created.body).toMatchObject({ title: "Sort the billing tickets", assignee: "triage", agentNodeId: "n-agent", createdBy: "Ada", status: "ready" });
+    const id = created.body.id;
+    let task: TaskView | undefined;
+    const end = Date.now() + 240_000;
+    while (Date.now() < end) {
+      task = (await api<TasksView>("/api/tasks?boardId=team")).body.tasks.find((t) => t.id === id);
+      if (task && ["done", "blocked"].includes(task.status)) break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    expect(task).toMatchObject({ status: "done", result: "Sorted 3 tickets" });
+    const commented = await api<TaskDetail>("/api/tasks/act", { method: "POST", body: JSON.stringify({ boardId: "team", id, by: "Ada", action: "comment", text: "--thanks, all three" }) });
+    expect(commented.body.thread.at(-1)).toMatchObject({ author: "Ada", body: "--thanks, all three" });
+    expect(commented.body.attempts.at(-1)).toMatchObject({ profile: "triage", outcome: "completed", summary: "Sorted 3 tickets" });
+    const wrong = await api<{ error: string }>("/api/tasks/act", { method: "POST", body: JSON.stringify({ boardId: "team", id, by: "Ada", action: "unblock" }) });
+    expect(wrong.status).toBe(409);
+    await api("/api/tasks/act", { method: "POST", body: JSON.stringify({ boardId: "team", id, by: "Ada", action: "archive" }) });
+    expect((await api<TasksView>("/api/tasks?boardId=team")).body.tasks.some((t) => t.id === id)).toBe(false);
+  }, 300_000);
+
+  // Until done (Hermes' goal mode): the task says so, and a person's "Mark done" needs no words and no judge
+  // (Hermes refuses an empty completion; McBot's --force is a person's override, hermes/MCBOT.md).
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("keeps a task going until done, and a person marks it done in one click", async () => {
+    const created = await api<TaskView>("/api/tasks", { method: "POST", body: JSON.stringify({ boardId: "team", title: "Plan the launch", body: "", assignee: null, by: "Ada", goal: true }) });
+    expect(created.status, JSON.stringify(created.body)).toBe(200);
+    expect(created.body).toMatchObject({ title: "Plan the launch", goal: true });
+    const done = await api<TaskDetail>("/api/tasks/act", { method: "POST", body: JSON.stringify({ boardId: "team", id: created.body.id, by: "Ada", action: "complete" }) });
+    expect(done.status, JSON.stringify(done.body)).toBe(200);
+    expect(done.body).toMatchObject({ status: "done", result: "Marked done by Ada", goal: true });
+  }, 120_000);
+
+  // The agent's abilities and its image maker, as Hermes reads them: only the chosen tool sets are
+  // offered to the model, and image_generate goes to the wired provider with the saved key.
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("gives an agent only its chosen abilities and makes an image with its image maker", async () => {
+    const a = client();
+    await until(() => a.provider.synced);
+    addNode(a.doc, { id: "n-artist", kind: "agent", position: { x: 0, y: 300 }, data: { name: "artist", displayName: "Artist", description: "", soul: "", skills: [], capabilities: ["file", "image_gen", "memory"] } });
+    addNode(a.doc, { id: "n-pictures", kind: "media", position: { x: 300, y: 300 }, data: { name: "pictures", label: "Pictures", media: "image", provider: "openai", model: "" } });
+    addEdge(a.doc, { id: "e-artist-model", source: "n-artist", target: "n-model", order: 0 });
+    addEdge(a.doc, { id: "e-artist-pictures", source: "n-artist", target: "n-pictures", order: 0 });
+    await until(() => graphFromDoc(a.doc).nodes.length === 4);
+    await engine.relay.flush();
+    a.provider.destroy();
+
+    expect((await api("/api/secrets", { method: "POST", body: JSON.stringify({ name: "MCBOT_PROBE_KEY", value: "probe-123" }) })).status).toBe(200);
+    const b2 = client();
+    await until(() => b2.provider.synced);
+    setNodeField(b2.doc, "n-model", "apiKeyEnv", "MCBOT_PROBE_KEY");
+    await until(() => (graphFromDoc(b2.doc).nodes.find((n) => n.id === "n-model")?.data as { apiKeyEnv?: string }).apiKeyEnv === "MCBOT_PROBE_KEY");
+    await engine.relay.flush();
+    b2.provider.destroy();
+    expect((await api("/api/secrets", { method: "POST", body: JSON.stringify({ name: "OPENAI_API_KEY", value: "sk-stub" }) })).status).toBe(200);
+    const compiled = await api<CompileResponse>("/api/compile", { method: "POST", body: JSON.stringify({ boardId: "team" }) });
+    expect(compiled.body.ok).toBe(true);
+    const cfg = readFileSync(join(workspace, "hermes/profiles/artist/config.yaml"), "utf8");
+    expect(cfg).toContain("platform_toolsets:\n  cli:\n    - file\n    - image_gen\n    - memory\n  api_server:\n    - file\n    - image_gen\n    - memory\nimage_gen:\n  provider: openai\n");
+    // Point the OpenAI image maker at the stub, as a line someone added with Hermes itself:
+    // McBot keeps it and adds its own key block after it.
+    const envFile = join(workspace, "hermes/profiles/artist/.env");
+    writeFileSync(envFile, `OPENAI_BASE_URL=${stub.url}\n`);
+
+    const { body } = await api<{ runId: string }>("/api/runs", { method: "POST", body: JSON.stringify({ boardId: "team", agentNodeId: "n-artist", prompt: 'call:image_generate {"prompt":"a burger mascot, flat colours"}' }) });
+    let events: RunEvent[] = [];
+    const end = Date.now() + 240_000;
+    while (Date.now() < end) {
+      events = (await api<RunEvent[]>(`/api/runs/${body.runId}`)).body;
+      if (events.some((e) => e.type === "run.finished")) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    expect(events.find((e) => e.type === "run.finished"), JSON.stringify(events.filter((e) => e.type !== "run.log").slice(-6))).toMatchObject({ status: "succeeded" });
+
+    const asked = stub.requests.filter((r) => r.tools?.length && JSON.stringify(r.messages).includes("burger mascot"));
+    const offered = new Set(asked[0]!.tools!.map((t) => t.function?.name));
+    // Hermes may defer image_generate behind its tool_search / tool_call bridge (tools/tool_search.py).
+    expect(offered.has("image_generate") || offered.has("tool_call")).toBe(true);
+    expect(offered.has("memory")).toBe(true);
+    expect(offered.has("web_search")).toBe(false);
+    expect(offered.has("terminal")).toBe(false);
+    // The model's key, saved in McBot, reached the model: Hermes' gateway reads it from the profile's .env.
+    expect(stub.authorizations[stub.requests.indexOf(asked[0]!)]).toBe("Bearer probe-123");
+    expect(readFileSync(envFile, "utf8")).toMatch(/^OPENAI_BASE_URL=http:.*\n\n# >>> McBot keys.*\nAPI_SERVER_HOST="127.0.0.1"\nAPI_SERVER_KEY="[0-9a-f]{48}"\nAPI_SERVER_PORT="\d+"\nMCBOT_PROBE_KEY="probe-123"\nOPENAI_API_KEY="sk-stub"\n# <<< McBot keys\n$/);
+    if (process.platform !== "win32") expect(statSync(envFile).mode & 0o777).toBe(0o600);
+    const listing = await api<{ entries: { name: string }[] }>("/api/fs/list?root=profile:artist&path=");
+    expect(listing.body.entries.map((e) => e.name)).not.toContain(".env");
+
+    expect(stub.imageRequests).toHaveLength(1);
+    expect(stub.imageRequests[0]).toMatchObject({ prompt: expect.stringContaining("burger mascot") });
+    const done = events.find((e): e is Extract<RunEvent, { type: "run.tool.finished" }> => e.type === "run.tool.finished" && e.tool === "image_generate");
+    expect(done?.isError).toBe(false);
+    const image = (JSON.parse(done!.output) as { image?: string }).image!;
+    expect(image.startsWith(join(workspace, "hermes/profiles/artist/"))).toBe(true);
+    expect(readFileSync(image).subarray(1, 4).toString()).toBe("PNG");
+  }, 300_000);
+
+  // A chat app: the bot's token and allowed users reach the agent's .env, the engine starts the
+  // gateway without a run, Hermes' Telegram adapter polls (here: a stub Bot API), the allowed user
+  // gets the agent's answer and a stranger gets nothing.
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("answers the allowed user on Telegram through the agent's own bot, and nobody else", async () => {
+    telegram = await startStubTelegram();
+    const a = client();
+    await until(() => a.provider.synced);
+    addNode(a.doc, { id: "n-desk", kind: "channel", position: { x: 300, y: 0 }, data: { name: "desk", label: "Desk bot", platform: "telegram", tokenEnv: "MCBOT_TELEGRAM_DESK_TOKEN", settings: {}, allowedUsers: ["111"], apiBase: telegram.url } });
+    addEdge(a.doc, { id: "e-desk", source: "n-agent", target: "n-desk", order: 0 });
+    await until(() => graphFromDoc(a.doc).nodes.some((n) => n.id === "n-desk"));
+    await engine.relay.flush();
+    a.provider.destroy();
+
+    expect((await api("/api/secrets", { method: "POST", body: JSON.stringify({ name: "MCBOT_TELEGRAM_DESK_TOKEN", value: "4242:stub-token" }) })).status).toBe(200);
+    const compiled = await api<CompileResponse>("/api/compile", { method: "POST", body: JSON.stringify({ boardId: "team" }) });
+    expect(compiled.body.ok).toBe(true);
+    expect(readFileSync(join(workspace, "hermes/profiles/triage/config.yaml"), "utf8")).toContain(`platforms:\n  telegram:\n    extra:\n      base_url: ${telegram.url}\n`);
+
+    // No run started: the engine itself brings the gateway up, and the bot starts polling.
+    await until(() => telegram!.calls.some((c) => c.method === "getUpdates" && c.token === "4242:stub-token"), 180_000);
+    const env = readFileSync(join(workspace, "hermes/profiles/triage/.env"), "utf8");
+    expect(env).toContain('TELEGRAM_ALLOWED_USERS="111"\nTELEGRAM_BOT_TOKEN="4242:stub-token"\n');
+
+    telegram.say(111, "what is 2+2");
+    await until(() => telegram!.sent.some((m) => m.chatId === "111" && m.text.trim() === "4"), 120_000);
+
+    telegram.say(999, "what is 2+2");
+    await new Promise((r) => setTimeout(r, 8000));
+    expect(telegram.sent.filter((m) => m.chatId === "999" && m.text.includes("4"))).toEqual([]);
+  }, 400_000);
+
+  // Approval cards: a risky command stops the run and asks the person (Hermes' runs API,
+  // approval.request); the answer goes back to Hermes, and a denied command never runs.
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("asks the person before a risky command and does not run it when they deny", async () => {
+    const target = join(workspace, "hermes/profiles/triage/workspace/keep-me");
+    writeFileSync(target, "important\n");
+    const prompt = `call:terminal ${JSON.stringify({ command: `rm -rf ${target}` })}`;
+    const { body } = await api<{ runId: string }>("/api/runs", { method: "POST", body: JSON.stringify({ boardId: "team", agentNodeId: "n-agent", prompt }) });
+    let summary: RunSummary | undefined;
+    await untilAsync(async () => {
+      summary = (await api<RunSummary[]>("/api/runs?boardId=team")).body.find((r) => r.runId === body.runId);
+      return Boolean(summary?.approval) || summary?.status !== "running";
+    }, 240_000);
+    expect(summary?.approval, JSON.stringify(summary)).toMatchObject({ command: expect.stringContaining("rm -rf"), choices: expect.arrayContaining(["once", "deny"]) });
+
+    expect((await api(`/api/runs/${body.runId}/approval`, { method: "POST", body: JSON.stringify({ choice: "deny" }) })).status).toBe(200);
+    let events: RunEvent[] = [];
+    await untilAsync(async () => {
+      events = (await api<RunEvent[]>(`/api/runs/${body.runId}`)).body;
+      return events.some((e) => e.type === "run.finished");
+    }, 240_000);
+    expect(events.some((e) => e.type === "run.approval.settled")).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("important\n");
+    expect((await api<RunSummary[]>("/api/runs?boardId=team")).body.find((r) => r.runId === body.runId)?.approval).toBeNull();
+    // Nothing left to answer.
+    expect((await api(`/api/runs/${body.runId}/approval`, { method: "POST", body: JSON.stringify({ choice: "once" }) })).status).toBe(409);
+  }, 400_000);
+
+  // Hermes' clarify through the runs API: McBot reads the question from the run's status (its event
+  // stream carries approvals only), shows it, and the person's answer reaches the agent.
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("shows the agent's question and gives it the person's answer", async () => {
+    const prompt = `call:clarify ${JSON.stringify({ questions: [{ question: "Which colour?", choices: ["red", "blue"] }] })}`;
+    const { body } = await api<{ runId: string }>("/api/runs", { method: "POST", body: JSON.stringify({ boardId: "team", agentNodeId: "n-agent", prompt }) });
+    let summary: RunSummary | undefined;
+    await untilAsync(async () => {
+      summary = (await api<RunSummary[]>("/api/runs?boardId=team")).body.find((r) => r.runId === body.runId);
+      return Boolean(summary?.question) || summary?.status !== "running";
+    }, 240_000);
+    expect(summary?.question, JSON.stringify(summary)).toMatchObject({ question: "Which colour?", choices: ["red (Recommended)", "blue"], multiSelect: false });
+    const promptId = summary!.question!.promptId;
+    expect((await api(`/api/runs/${body.runId}/reply`, { method: "POST", body: JSON.stringify({ promptId, answer: "blue" }) })).status).toBe(200);
+    let events: RunEvent[] = [];
+    await untilAsync(async () => {
+      events = (await api<RunEvent[]>(`/api/runs/${body.runId}`)).body;
+      return events.some((e) => e.type === "run.finished");
+    }, 240_000);
+    expect(events.find((e) => e.type === "run.question.settled")).toMatchObject({ promptId, answer: "blue" });
+    const answered = events.find((e) => e.type === "run.tool.finished" && e.tool === "clarify");
+    expect(answered && answered.type === "run.tool.finished" ? JSON.parse(answered.output) : null).toMatchObject({ responses: [{ question: "Which colour?", user_response: "blue" }] });
+    expect((await api<RunSummary[]>("/api/runs?boardId=team")).body.find((r) => r.runId === body.runId)?.question).toBeNull();
+    // Nothing left to answer.
+    expect((await api(`/api/runs/${body.runId}/reply`, { method: "POST", body: JSON.stringify({ promptId, answer: "red" }) })).status).toBe(409);
+  }, 400_000);
+
+  // Never run (approvals.deny) holds even when the agent never asks: Hermes checks it before any bypass.
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("never runs a blocked command, even for an agent that never asks", async () => {
+    const set = async (fields: Record<string, unknown>) => {
+      const c = client();
+      await until(() => c.provider.synced);
+      for (const [k, v] of Object.entries(fields)) setNodeField(c.doc, "n-agent", k, v ?? undefined);
+      await until(() => Object.entries(fields).every(([k, v]) => JSON.stringify((graphFromDoc(c.doc).nodes.find((n) => n.id === "n-agent")?.data as Record<string, unknown>)[k] ?? null) === JSON.stringify(v)));
+      await engine.relay.flush();
+      c.provider.destroy();
+      const compiled = await api<CompileResponse>("/api/compile", { method: "POST", body: JSON.stringify({ boardId: "team" }) });
+      expect(compiled.body.ok).toBe(true);
+    };
+    await set({ approvals: "off", neverRun: ["rm -rf *"] });
+    expect(readFileSync(join(workspace, "hermes/profiles/triage/config.yaml"), "utf8")).toContain('\napprovals:\n  mode: "off"\n  deny:\n    - rm -rf *\n');
+    const target = join(workspace, "hermes/profiles/triage/workspace/precious");
+    writeFileSync(target, "keep\n");
+    const { body } = await api<{ runId: string }>("/api/runs", { method: "POST", body: JSON.stringify({ boardId: "team", agentNodeId: "n-agent", prompt: `call:terminal ${JSON.stringify({ command: `rm -rf ${target}` })}` }) });
+    let events: RunEvent[] = [];
+    await untilAsync(async () => {
+      events = (await api<RunEvent[]>(`/api/runs/${body.runId}`)).body;
+      return events.some((e) => e.type === "run.finished");
+    }, 240_000);
+    expect(existsSync(target)).toBe(true);
+    const out = events.find((e) => e.type === "run.tool.finished" && e.tool === "terminal");
+    expect(out && out.type === "run.tool.finished" ? out.output : "", JSON.stringify(events.filter((e) => e.type !== "run.log").slice(-4))).toContain("BLOCKED");
+    await set({ approvals: null, neverRun: null });
+  }, 400_000);
+
+  // Knowledge → Business: a Word file is read by Hermes' own extractor, goes on the board, compiles into
+  // every agent's business-files skill, and the agent reads it with skill_view.
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("reads a business document and gives it to the agents as a skill", async () => {
+    const res = await fetch(`${engine.url}/api/knowledge/doc?name=${encodeURIComponent("plan.docx")}`, {
+      method: "POST", headers: { origin: ORIGIN, "content-type": "application/octet-stream" }, body: readFileSync(join(import.meta.dirname, "../test/fixtures/docs/plan.docx")),
+    });
+    const added = (await res.json()) as { name: string; text: string; bytes: number; file: string };
+    expect(res.status, JSON.stringify(added)).toBe(200);
+    expect(added).toMatchObject({ name: "plan.docx", file: "knowledge/plan.docx" });
+    expect(added.text).toContain("We sell sourdough to cafes.");
+    expect(existsSync(join(workspace, "files/knowledge/plan.docx"))).toBe(true);
+
+    const c = client();
+    await until(() => c.provider.synced);
+    addDoc(c.doc, { id: "doc-plan", name: added.name, text: added.text, bytes: added.bytes, by: "Ada", at: 1 });
+    await until(() => (graphFromDoc(c.doc).docs ?? []).length === 1);
+    await engine.relay.flush();
+    c.provider.destroy();
+    const compiled = await api<CompileResponse>("/api/compile", { method: "POST", body: JSON.stringify({ boardId: "team" }) });
+    expect(compiled.body.ok).toBe(true);
+    expect(readFileSync(join(workspace, "hermes/profiles/triage/skills/mcbot/business-files/references/plan-docx.md"), "utf8")).toContain("We sell sourdough to cafes.");
+
+    const prompt = `call:skill_view ${JSON.stringify({ name: "business-files", file_path: "references/plan-docx.md" })}`;
+    const { body } = await api<{ runId: string }>("/api/runs", { method: "POST", body: JSON.stringify({ boardId: "team", agentNodeId: "n-agent", prompt }) });
+    let events: RunEvent[] = [];
+    await untilAsync(async () => {
+      events = (await api<RunEvent[]>(`/api/runs/${body.runId}`)).body;
+      return events.some((e) => e.type === "run.finished");
+    }, 240_000);
+    const read = events.find((e) => e.type === "run.tool.finished" && e.tool === "skill_view");
+    expect(read && read.type === "run.tool.finished" ? read.output : "", JSON.stringify(events.filter((e) => e.type !== "run.log").slice(-4))).toContain("We sell sourdough to cafes.");
+  }, 400_000);
+
+  // Approvals → Never ask compiles to approvals.mode "off" (quoted: a bare off is false in YAML 1.1), and Hermes honours it.
+  it.skipIf(!process.env.MCBOT_HERMES_BIN && process.env.MCBOT_E2E !== "1")("runs a risky command without asking when the agent is set to never ask", async () => {
+    const set = async (value: string | null) => {
+      const c = client();
+      await until(() => c.provider.synced);
+      setNodeField(c.doc, "n-agent", "approvals", value ?? undefined);
+      await until(() => ((graphFromDoc(c.doc).nodes.find((n) => n.id === "n-agent")?.data as { approvals?: string }).approvals ?? null) === value);
+      await engine.relay.flush();
+      c.provider.destroy();
+      const compiled = await api<CompileResponse>("/api/compile", { method: "POST", body: JSON.stringify({ boardId: "team" }) });
+      expect(compiled.body.ok).toBe(true);
+    };
+    await set("off");
+    expect(readFileSync(join(workspace, "hermes/profiles/triage/config.yaml"), "utf8")).toContain('\napprovals:\n  mode: "off"\n');
+    const target = join(workspace, "hermes/profiles/triage/workspace/scratch");
+    writeFileSync(target, "temporary\n");
+    const { body } = await api<{ runId: string }>("/api/runs", { method: "POST", body: JSON.stringify({ boardId: "team", agentNodeId: "n-agent", prompt: `call:terminal ${JSON.stringify({ command: `rm -rf ${target}` })}` }) });
+    let events: RunEvent[] = [];
+    await untilAsync(async () => {
+      events = (await api<RunEvent[]>(`/api/runs/${body.runId}`)).body;
+      return events.some((e) => e.type === "run.finished");
+    }, 240_000);
+    expect(events.some((e) => e.type === "run.approval"), JSON.stringify(events.filter((e) => e.type !== "run.log").slice(-4))).toBe(false);
+    expect(existsSync(target)).toBe(false);
+    await set(null);
+    expect(readFileSync(join(workspace, "hermes/profiles/triage/config.yaml"), "utf8")).not.toContain("approvals:");
+  }, 400_000);
+});

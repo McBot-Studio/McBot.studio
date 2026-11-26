@@ -1,0 +1,247 @@
+# The Hermes mapping — verified
+
+Every Hermes path, config key and CLI flag McBot writes or calls, with where it
+was confirmed. Verified against **NousResearch/hermes-agent v0.23.1 @ `3b42157`**
+(2026-11-09) by reading the source, running `hermes --help`, and running
+compiled profiles through the real CLI. Line numbers refer to that commit.
+
+Last sync (2026-11-11, from `1e208b2`): every line cited here was found again,
+unchanged, at v0.23.1 and its number updated; the tool set list lost only
+`yuanbao` (moved to a plugin, never used by McBot); `_get_platform_tools({}, "cli")`
+still returns McBot's `DEFAULT_CAPABILITIES`; the sessions table McBot reads
+has the same columns; and the real-Hermes tests (`MCBOT_E2E=1 npm test`) pass.
+
+Hard rule: nothing goes in here (or in `src/compile/`) without a source line or
+a real run behind it. If Hermes changes, re-verify here first.
+
+## Where a compiled agent lives
+
+| Fact | Source |
+|---|---|
+| A named profile is `<root>/profiles/<name>/`; `<root>` is `HERMES_HOME` when set, else `~/.hermes` | `hermes_cli/profiles.py:2324-2352` (`profile_root_for_env_home`, `resolve_profile_env`) |
+| So `HERMES_HOME=<out> hermes -p <name>` runs `<out>/profiles/<name>` — McBot's output root never touches `~/.hermes` | same; confirmed by real runs |
+| Profile id grammar `^[a-z0-9][a-z0-9_-]{0,63}$` | `hermes_constants.py:401` (`PROFILE_ID_RE`) |
+| Reserved names (`hermes default test tmp root sudo` + every subcommand) | `hermes_cli/profiles.py:280-287` |
+| A profile is "live" only with an identity marker: `config.yaml .env SOUL.md profile.yaml auth.json state.db` | `hermes_constants.py:399,433-438` |
+| Dirs `hermes profile create` bootstraps: `memories sessions skills skins logs plans workspace cron home` | `hermes_cli/profiles.py:43` (`_PROFILE_DIRS`) |
+| `SOUL.md` sits at the profile root, injected verbatim as system-prompt slot #1 | `website/docs/user-guide/which-file-does-what.md`; `hermes_cli/profiles_initialization.py:36-48` |
+| SOUL.md is always in the system prompt, whatever the working directory (project context files are found from the cwd, SOUL.md from the profile home), so McBot puts the board's brief there ("Shared knowledge" section, McBot's own text, no Hermes key) | `agent/prompt_builder.py:1767` (`build_context_files_prompt`: SOUL.md appended unless it already filled the identity slot), `:1520` (`load_soul_md`); `agent/system_prompt.py` `_context_files_part` |
+| `profile.yaml` keys `description`, `display_name` | `hermes_cli/profiles.py:874-893` (`read_profile_meta`) |
+| `.no-bundled-skills` marker: existence only; Hermes still seeds essential skills. Compiled only when the board turns built-in skills off (`builtinSkills: false`) | `hermes_cli/profiles.py:102`, `tools/skills_sync.py:400` |
+
+## config.yaml
+
+Hermes parses config, profile.yaml and SKILL.md frontmatter as **YAML 1.1**
+(`hermes_yaml.py`: ruamel, `version = (1, 1)`), so bare `yes/no/on/off/y/n` are
+booleans and `0755` is octal. McBot emits YAML 1.1 so the library quotes them.
+
+| Graph | config.yaml | Source |
+|---|---|---|
+| primary model | `model: { provider: custom:mcbot-<name>, default: <model id> }` | `website/docs/user-guide/configuring-models.md:137-148`; `custom:<key>` always targets the saved entry: `hermes_cli/runtime_provider_custom.py:132-146` |
+| each model node | `providers.mcbot-<name>: { api, key_env?, default_model, transport: chat_completions }` | canonical v12 shape `hermes_cli/config_providers.py:287-303`; read by `runtime_provider_custom.py:79,148-180` (`api`/`url`/`base_url`, `key_env`/`api_key`, `default_model`, `api_mode`/`transport`) |
+| `transport` value | `chat_completions` ∈ `_VALID_API_MODES` | `hermes_cli/runtime_provider.py:135` |
+| fallback models (edge order ≥ 1) | `fallback_providers: [{ provider, model }]` | `hermes_cli/config_defaults.py:24`; `agent/agent_init_fallback.py:11-19` |
+| tool node | `mcp_servers.<name>: { command, args, env }` or `{ url, headers }` | `website/docs/reference/mcp-config-reference.md`; read at `tools/mcp_tool_config.py:719` |
+| — | **no** `_config_version` (an unversioned file is treated as current; "do not copy it into another config") | `cli-config.yaml.example:7-10`; `hermes_cli/config_migrations.py:884-893` |
+| agent browser settings (only what differs from Hermes' defaults) | `browser: { headed: true, engine: lightpanda, use_real_profile: true }` | `hermes_cli/config_defaults.py:410-445` (`headed`: a visible Chromium window; `engine`: `auto` or `lightpanda`, `lightpanda` on PATH; `use_real_profile`: a snapshot of the person's own Chromium profile); read per profile by `tools/browser_session_cloud.py:23,35-51,126-153`; observed: a compiled profile reads `engine lightpanda, headed True` |
+| agent loop: steps per message (the board's `maxSteps`, only when set) | `agent: { max_turns: N }` | `hermes_cli/config_defaults.py:64-67` (`max_turns: None` = unlimited; positive int caps); a served profile reads its own value every turn, `gateway/run.py:1604-1620` `_current_max_iterations` (HERMES_HOME override → that profile's config.yaml), used by runs-API agents at `gateway/platforms/api_server.py:2217` and messaging turns at `gateway/run_turn_runner.py:1386` |
+| agent thinking (the board's `reasoning`, only when set) | `agent: { reasoning_effort: <level> }`, level one of `none` (off) `minimal` `low` `medium` `high` `xhigh` `max` `ultra` | `hermes_constants.py:1141-1168` (`VALID_REASONING_EFFORTS`, `parse_reasoning_effort`: "none"/"false" = disabled, unknown = model default); read per run by the gateway via `resolve_reasoning_config`, `gateway/run_config_loaders.py:304-314` (per-model override > `agent.reasoning_effort`) |
+| agent approvals (the board's `approvals`, only when set): when it asks before a risky command | `approvals: { mode: manual \| smart \| "off" }`: `manual` always asks, `smart` lets a guardian LLM approve the clearly safe, deny the destructive and ask when unsure, `off` never asks (YOLO; `approvals.deny` globs still block). `off` is quoted: YAML 1.1 reads a bare `off` as false (Hermes maps false to "off" too). Unset = `smart` | `tools/approval_context.py:276` (`_VALID_MODES`), `:279-293` (`_normalize_approval_mode`), `:307-324` (`_get_approval_mode`, read per profile through `load_config_readonly`); `hermes_cli/config_defaults.py:1612-1623` (default `smart`); `tools/approval_smart.py:17-32` (guardian verdicts); `tools/approval.py:613,1231` (`off` skips the gate); observed: E2E "runs a risky command without asking when the agent is set to never ask" |
+| agent never runs (the board's `neverRun`, only when set): commands it may never run | `approvals: { deny: [<glob>, …] }`: case-insensitive fnmatch globs over the normalized command and its deobfuscated variants, checked before the YOLO / `mode: off` bypass and before a container's fast path; a match is refused with "BLOCKED: … matches the user-defined deny rule" | `tools/approval_floors.py:25-53` (`_match_user_deny_rule`, `_user_deny_block_result`); `tools/approval.py:1299-1307` (`_user_deny_block`); `hermes_cli/config_defaults.py:1635-1637`; observed: E2E "never runs a blocked command, even for an agent that never asks" |
+| agent blocked websites (the board's `blockedSites`, only when set) | `security: { website_blocklist: { enabled: true, domains: [<host>, …] } }`: a bare host blocks it and its subdomains, `*.example.com` only subdomains; URLs and `www.` are reduced to the host. Read per profile (`get_hermes_home()/config.yaml`), cached 30 s; web extract and the browser refuse a blocked URL. McBot owns `enabled` and `domains` only while the board sets a list or the existing one isn't switched off (`enabled: false` stays the person's); `shared_files` and the rest of `security` stay in Hermes | `tools/website_policy.py:49-57` (`_normalize_rule`), `:113-140` (`load_website_blocklist`), `:144-150` (`_match_host_against_rule`); `tools/web_tools_extract.py:283-293`; `tools/browser_url_policy.py:29`; `hermes_cli/config_defaults.py:1734` |
+| tool node: which of its tools reach the model (the board's `toolsInclude` / `toolsExclude`, only when set) | `mcp_servers.<name>.tools: { include: [...], exclude: [...] }` | `tools/mcp_tool_registration.py:251-265`: `include` is a whitelist (`[]` registers nothing), `exclude` a blacklist, exact names or fnmatch globs, include wins; the schema cache keeps the filter |
+| agent abilities (`capabilities`, when set or a video maker is wired) | `platform_toolsets: { cli: [<tool set keys>] }` — McBot's `--source mcbot` runs resolve on the `cli` surface | `gateway/session_policy.py:86-88,659-693` (`SURFACES`, `_resolve_toolsets` → `_get_platform_tools(config, 'cli')`); `hermes_cli/tools_config.py:572-647`; observed: only the listed tool sets reach the model |
+| tool set keys | `web browser file terminal code_execution vision image_gen video_gen tts memory session_search skills todo clarify delegation cronjob kanban computer_use connections` | `hermes_cli/tools_config.py:69-95` (`CONFIGURABLE_TOOLSETS`) |
+| unset list = Hermes' default for `cli` | every key above except `video_gen` and `kanban` | `_get_platform_tools({}, "cli")` run in `hermes/`; `tools_config.py:111` (`_DEFAULT_OFF_TOOLSETS`) |
+| an explicit list keeps MCP servers | configured `mcp_servers` are added unless the list names some | `tools_config.py:734-754` (`_merge_mcp_servers`); run in `hermes/` |
+| image maker | `image_gen: { provider, model? }` | `agent/image_gen_registry.py:28-40` (`image_gen.provider`); `plugins/image_gen/_common.py:71-82` and `hermes_cli/web_routers/tools.py:467` (`image_gen.model`); observed with provider `openai` |
+| video maker | `video_gen: { provider, model? }` | `agent/video_gen_registry.py:5,30-37`; `hermes_cli/web_routers/tools.py:467` |
+| maker ids and keys | image: `openai` OPENAI_API_KEY, `openrouter` OPENROUTER_API_KEY, `fal` FAL_KEY, `xai` XAI_API_KEY, `krea` KREA_API_KEY, `deepinfra` DEEPINFRA_API_KEY, `meta-ai` META_MODEL_API_KEY; video: `fal`, `openrouter`, `xai`, `deepinfra` (same keys) | `provider_id` / `name` in `plugins/image_gen/*/__init__.py`, `plugins/video_gen/*/__init__.py`; `requires_env` in each `plugin.yaml` |
+| chat app with an own Bot API server | `platforms: { telegram: { extra: { base_url } } }` | `gateway/config_loader.py:138-171` (`merge_platform_sections`: top-level `platforms.*`); `plugins/platforms/telegram/adapter.py:2994-2998`; observed |
+
+`mcbot-` prefixes the provider key so a model node can never shadow a built-in
+provider id (`openrouter`, `anthropic`, …). API keys are never written: only the
+env var name (`key_env`).
+
+## Skills
+
+| Fact | Source |
+|---|---|
+| Bundled skills (44) are seeded into a home's `skills/<category>/` and recorded in `skills/.bundled_manifest`; a gateway seeds only its own home | `tools/skills_sync.py:38,72,402` |
+| `hermes -p <agent> skills opt-in --sync` removes the opt-out marker and seeds now ("Re-seeded N bundled skill(s)"). McBot runs it once per compiled profile without a `.bundled_manifest`, after a compile (`engine/skills.ts`) | `hermes_cli/subcommands/skills.py:129-133`; `hermes_cli/skills_hub.py:1257` |
+| `hermes -p <agent> skills install official/<category>/<name> --yes` installs one of `optional-skills/` (141) into `skills/<category>/<name>/` after Hermes' scan | `hermes_cli/subcommands/skills.py:54-63`; `--yes` from `hermes_cli/subcommands/_shared.py:19`; verified on Hermes' runtime |
+| `hermes -p <agent> skills uninstall <name> --yes` removes a hub-installed skill; `hermes -p <agent> skills update <name>` updates one (edited ones are skipped without `--force`). There is no `skills remove` | `hermes_cli/subcommands/skills.py:79-92`; dispatch `hermes_cli/skills_hub.py:1553-1555` |
+| Skills an agent writes (`skill_manage` create) land in `skills/[<category>/]<name>/SKILL.md`, or under `skills.create_dir`; bundled ones are listed in `skills/.bundled_manifest` (`name:hash`), hub installs in `skills/.hub/lock.json` → `installed`. McBot calls anything else "taught itself" (`profileSkills`) | `tools/skill_manager_tool.py:212-220` `_resolve_skill_dir`; `tools/skills_sync.py:2-6`; `tools/skills_hub.py:62-63,322` |
+| `hermes skills search <q> --json --limit N` prints `[{name, identifier, source, trust_level, description}]` across skills.sh, GitHub, ClawHub and the other registries; `hermes skills install <identifier or https URL to a SKILL.md> --category <dir> --yes` quarantines, scans (skills-guard) and installs, recording it in `skills/.hub/lock.json`. Verified on v0.23.2 with a raw GitHub SKILL.md URL (`source: url`, verdict safe) | `hermes_cli/subcommands/skills.py:45-63`; `hermes_cli/skills_hub.py:354-362` |
+| Plugins: the curated catalog is `plugin-catalog/<name>.yaml` (name, title, description, category, tier, maintainer, repo, sha, version, platforms, capabilities.provides_tools/provides_hooks/requires_env). Per agent: `plugins list --json` (`[{name, status: "enabled"/"not enabled", version, description, source, removed}]`), `plugins install <name> --enable --yes-deps` (clones the pinned sha, scans, enables, no prompt), `plugins enable <name> --no-allow-tool-override`, `plugins disable <name>`, `plugins remove <name>`; Hermes writes `plugins.enabled` / `plugins.disabled` in that agent's config.yaml. Verified on v0.23.2 by installing `abeyance` with stdin closed (needs an unmanaged home: with `HERMES_MANAGED` set, enable fails creating `cron/`) | `hermes_cli/subcommands/plugins.py:18-60,131-161`; `hermes_cli/plugin_catalog.py` |
+| Plugins from GitHub (Add from GitHub): `plugins install <owner/repo[/path]> --enable --yes-deps`. The identifier is a Git URL or `owner/repo` shorthand, a folder after it (`owner/repo/path/to/plugin`, or `#path`); `https://github.com/o/r/tree/<ref>/<path>` links are read too. McBot sends the shorthand (engine `GITHUB_SOURCE_RE`), argv only, no shell | `hermes_cli/plugins_cmd.py:297-339` (`_resolve_git_url`) |
+| `computer_use` image captures save a copy in the home's `cache/images/computer_use_<id>.png` and put it in the result as `screenshot_path` (and the text "shareable screenshot saved to …"); the call's input carries `action`, `element`, `text`, `key` | `tools/computer_use/tool.py:614-623,805-811`; `tools/computer_use/schema.py:190-201` |
+| The system prompt lists every visible skill as `- <name>: <description>` under its category (a one-skill category is one top-level row) in `<available_skills>`, and tells the model to load a matching one with `skill_view(name)`. So a skill costs one line per message; its text is read only when needed. McBot's guide (`src/compile/mcbotGuide.ts`) relies on this | `agent/prompt_builder.py:1303-1368` (`_render_skills_index`) |
+| A skill's category is the folders between `skills/` and its own folder (`skills/mcbot/mcbot-studio/SKILL.md` → category `mcbot`, name `mcbot-studio`); the description shown is cut at 60 characters on a word boundary | `agent/prompt_builder.py:1144-1158` (`_build_snapshot_entry`); `agent/skill_utils.py:846,857-866` (`SKILL_PROMPT_DESC_LIMIT`, `clip_skill_description`) |
+
+`<profile>/skills/<name>/SKILL.md`, frontmatter `name, description, version,
+author, license, platforms, metadata.hermes.tags` (`skills/AGENTS.md`).
+Discovery walks the tree recursively, so a flat `skills/<name>/` works
+(`agent/skill_utils.py:878-887`). Descriptions are capped at 60 chars, Hermes'
+authoring standard.
+
+## Running and observing
+
+| Fact | Source |
+|---|---|
+| One headless turn: `hermes -p <p> chat --query-file - --oneshot --format stream-json` | `hermes chat --help` (run); `website/docs/reference/cli-commands.md:128-187` |
+| stream-json records: `system/init`, `text`, `tool_use`, `tool_result`, `result{session_id, exit_code, text, tokens{input,output,total,cache_read,cache_write}, duration_ms, error?}` | same doc; real captures in `test/fixtures/hermes-stream/` |
+| `system/init` arrives with empty `model` and `session_id`; the real session id comes in `result` | observed |
+| Exit codes (`chat --oneshot`): 0 ok, 1 failed or partial, 130 interrupted; 75 and the provider-wall codes are for task-board workers only | `hermes_cli/turn_exit.py:16-43` (`turn_exit_code`); `website/docs/reference/cli-commands.md:192-205` |
+| MCP tools are named **`mcp__<server>__<tool>`**, `[^A-Za-z0-9_]` → `_` | `tools/mcp_tool_schema.py:147-185`; observed |
+| Deferred MCP tools may be called through the `tool_call` bridge: `{name, arguments}` or `{calls:[…]}` | `tools/tool_labels.py:148-163`; observed |
+| `image_generate` returns `{"success": true, "image": "<path>"}` and saves into the **profile's** `cache/generated/images/`; `video_generate` returns `{"video": "<path>"}` | `agent/image_gen_provider.py:83-123`; `agent/video_gen_provider.py:75-120`; observed |
+| `image_generate` may be deferred behind `tool_search` / `tool_call` like MCP tools | observed |
+| Per-session tokens and cost: `state.db` table `sessions` (`model, billing_provider, billing_base_url, input_tokens, output_tokens, estimated_cost_usd, actual_cost_usd, cost_status, …`) in the **profile's** home | `hermes_state_common.py:467-513`; `hermes_state.py:181` |
+| Custom/local endpoints are recorded with `cost_status: unknown`, `estimated_cost_usd: 0` | observed |
+| `fallback_providers` failover: primary on a dead port, the turn is answered by the fallback and recorded as `billing_provider: custom:mcbot-<fallback>` | observed |
+
+## Memory
+
+`<profile>/memories/MEMORY.md` and `USER.md`; entries joined by `"\n§\n"`, no
+trailing newline (`tools/memory_tool_store.py:26,697-713`). Budgets 2200 / 1375
+chars (`hermes_cli/config_defaults.py:1295-1310`). Hermes takes an `flock` on
+`<file>.lock` (`memory_tool_store.py:259-298`); Node cannot, so McBot refuses
+edits while a run of that profile is active and requires the sha256 the editor
+read (optimistic concurrency). Hermes memory has **no "pin"** — McBot does not
+invent one.
+
+## Tasks: Hermes' kanban
+
+| Fact | Source |
+|---|---|
+| One board per Hermes home, shared by every profile in it ("forking the board per profile would break the dispatcher/worker handoff"): `kanban_home()` is `HERMES_KANBAN_HOME`, else the default root; the default board's database is `<root>/kanban.db` | `hermes_cli/kanban_db.py:401-409` (`kanban_home`), `:563-566` (`kanban_db_path`), `:330` (`DEFAULT_BOARD`); observed: `hermes -p triage kanban create … --assignee writer` and `hermes -p writer kanban list` read the same `<root>/kanban.db` |
+| Tables McBot reads: `tasks`, `task_links (parent_id, child_id)`, `task_comments`, `task_runs` (one row per attempt; a worker's `kanban_complete --summary` lands in `task_runs.summary`, not `tasks.result`); times are Unix seconds | `hermes_cli/kanban_db.py:777-955` (`SCHEMA_SQL`); observed |
+| Statuses, in Hermes' column order: `triage todo scheduled ready running blocked review done`, plus `archived` | `hermes_cli/kanban_workflow.py:114-142` (`DEFAULT_WORKFLOW`, `DEFAULT_STATUSES`) |
+| Task ids are `t_` + 8 hex | `hermes_cli/kanban_db.py:988-991` (`_new_task_id`) |
+| `hermes kanban create <title> --body-file - --assignee <profile> --parent <id> --created-by <name> --json` (prints the task as JSON); `comment <id> <text…> --author <name>`; `assign <id> <profile\|none>`; `complete <id> --force [--result=<text>]` (a person's verdict, see below); `block <id> [reason…]`; `unblock <id>`; `reopen-review <id> --reason=<text>` (a person's "ask for changes": review → ready); `archive <id>`. McBot puts free text after `--`, or as `--flag=<text>` so a text starting with `-` is not read as a flag | `hermes_cli/kanban_parser.py:160-372`; `hermes kanban <cmd> --help`; observed |
+| `hermes kanban create … --goal [--goal-max-turns N]`: the worker runs in a goal loop. After each turn a judge checks its answer against the card's title and body; not done → it continues in the same session; the judge rules it unachievable, or the turns run out (default 20) → the card is blocked with the reason as the run's summary; it finishes only through `kanban_complete`, which the judge also checks. The judge is the `goal_judge` auxiliary task: unset = the profile's own provider and model. A judge that can't be reached stops the loop (it never spins); stored as `tasks.goal_mode` | `hermes_cli/kanban_parser.py:208-215`; `hermes_cli/kanban.py:374-375`; `hermes_cli/kanban_db.py:852-857` (`goal_mode`, `goal_max_turns`); `hermes_cli/goals.py:32` (`DEFAULT_MAX_TURNS`), `:880-945` (`judge_goal`), `:1618-1740` (`run_kanban_goal_loop`); `gateway/session_kanban.py:420-438`; `agent/auxiliary_client.py:4459-4470` (auto = main provider + model); observed: `kanban create --goal` stores `goal_mode = 1` |
+| A person's "Mark done" / "Approve": `kanban complete <id> --force`. Upstream runs the goal judge on every CLI completion of a goal card, a person's too, and rejects one with no evidence ("empty response"); Hermes' dashboard instead calls `complete_task(force=True)` with no judge. McBot's patch (`hermes/MCBOT.md`): `--force` from outside any worker (no `HERMES_KANBAN_TASK`) skips the judge; a worker is still judged. Hermes also refuses any completion with no result, summary or stored result, except a review's approval, so McBot sends what came of the task (else "Marked done by <name>") | `hermes_cli/kanban_parser.py:295-306` (`--force`); `hermes_cli/kanban.py:815-826` (`_worker_run_id_for`), `:828-879` (`_goal_mode_handoff_rejection`), `:913-920` (patched); `hermes_cli/kanban_db.py:2777-2808` (`_gate_empty_completion`); `plugins/kanban/dashboard/plugin_api.py:592-594`; observed with a model configured: unpatched, rejected by judge; patched, `Completed`; with `HERMES_KANBAN_TASK` set, still judged |
+| A kanban worker's scope is environment variables (`HERMES_KANBAN_TASK`, `_RUN_ID`, `_BOARD`, `_DB`, `_WORKSPACE`…, `HERMES_PROFILE`, `HERMES_SESSION_SOURCE`, `HERMES_TENANT`); a CLI call with `HERMES_KANBAN_TASK` set may change only that task. McBot strips them from every Hermes it starts (`hermesEnv`), so an engine started inside an agent's task never acts as that worker | `gateway/session_kanban.py:164-170`; `hermes_cli/kanban_db_dispatch.py:2754-2794`; `hermes_cli/kanban.py:815-818` |
+| A ready task with an assignee starts only while the root's gateway runs: it embeds the dispatcher (`kanban.dispatch_in_gateway`, default true; a tick every `kanban.dispatch_interval_seconds`, default 60). Without a gateway, tasks stay in `ready` | `gateway/kanban_watchers.py:209-262`, `gateway/kanban_watchers_dispatcher.py:49`; `hermes kanban init` prints the same. The engine runs `hermes gateway ensure` after a person creates, assigns or unblocks a task |
+| The dispatcher hands the task to its profile's owner in the gateway (`hermes_cli.kanban_worker_client`), with `HERMES_KANBAN_TASK` set, so the worker gets the task-scoped tools (`kanban_complete`, `kanban_block`, `kanban_comment`, `kanban_create`, …) without the `kanban` tool set | `hermes_cli/kanban_db_dispatch.py:2697-2700,2754-2873`; `tools/kanban_tools.py:83-90` (`_visible`); observed: a worker on the stub model called `kanban_complete` and the task went `ready → running → done` |
+| Outside a dispatched task, an agent gets the kanban tools (create, list, link, unblock…) only with the `kanban` tool set in its `platform_toolsets` | `tools/kanban_tools.py:1-5,37,83-96`; `toolsets.py:153-163` |
+| A task's work runs in its own session in the assignee's `state.db`, whose opening turn is `work kanban task <id>`, written as the dispatcher's turn (source `kanban`). McBot finds it by that text and reads its `messages` (`role`, `content`, `tool_calls` as OpenAI JSON, `timestamp` in seconds) for the task panel's progress (`engine/hermesData.ts` `readTaskWork`) | `gateway/session_kanban.py:142,164-169,383-386`; `persistence/sqlite/_schema_ddl.py:197-219` |
+| Each attempt (`task_runs`) records its worker's `worker_pid`, `last_heartbeat_at`, `claim_expires` and `max_runtime_seconds`; status `running \| done \| blocked \| crashed \| timed_out \| failed \| released` | `hermes_cli/kanban_db.py:910-934` |
+| Per-task worker logs: `<root>/kanban/logs/<task id>.log` for the default board (what `hermes kanban log` reads) | `hermes_cli/kanban_db.py:586-589` (`worker_logs_dir`), `:540-560` (`_board_path`); `hermes_cli/kanban_db_dispatch.py:2645-2654` |
+
+## Schedules: Hermes' cron
+
+| Fact | Source |
+|---|---|
+| Cron is per profile: each agent's jobs live in `<profile>/cron/jobs.json` as `{ jobs: [...], updated_at }` and run with that profile's `.env`, config and skills | `cron/jobs.py:82-95` (comment and `JOBS_FILE`), `:1377` (`load_jobs`); observed |
+| Job fields McBot reads: `id` (12 hex), `name`, `prompt`, `schedule_display`, `enabled`, `state`, `next_run_at`, `last_run_at`, `last_status`, `last_error` | `cron/jobs.py:1866` (`uuid4().hex[:12]`); a job `hermes -p triage cron create` wrote |
+| `hermes -p <agent> cron create [--name N] <schedule> [prompt]` (schedule: `30m`, `every 2h` or a cron line); `pause`, `resume`, `run` (on the next scheduler tick), `remove` `<job_id>` | `hermes_cli/subcommands/cron.py:39,188-207`; `hermes cron <cmd> --help` |
+| Jobs fire only while a gateway serves the profile ("Scheduler is not ready … no gateway serves it"). The engine runs `hermes gateway ensure` after a schedule is added, resumed or run, and at start while any compiled agent has an enabled job | `hermes cron create` output; observed: `cron run` fired within seconds under the multiplex gateway, `last_status: ok` |
+
+## Runs over Hermes' API server (approvals) — used for McBot's own Hermes
+
+What approval cards are built on. Verified end to end against the stub model on 2026-11-12:
+a run asked to `rm -rf`, Hermes paused with `approval.request`, McBot answered `once`, the
+command ran, the run completed. McBot's own Hermes now runs every agent this way
+(`engine/hermesRuns.ts`, `engine/runner.ts` `executeApi`); an external Hermes keeps one-shot
+`hermes chat`. `engine/engine.test.ts` ("asks the person before a risky command…") checks it.
+
+| Fact | Source |
+|---|---|
+| The gateway starts its API server when its environment has `API_SERVER_KEY` (16+ characters); `API_SERVER_PORT` and `API_SERVER_HOST` set where it listens (default 8642) | `gateway/config_env.py:121-129` (`_api_server`), `gateway/config.py:550-565`; `gateway/platforms/api_server.py:165-168` |
+| Under the multiplex gateway each profile is at `/p/<profile>/v1/...`, authorized by that profile's own `API_SERVER_KEY` (its `.env`); no key there = 401 | `gateway/platforms/api_server.py:1-6`, `:1389-1430` (`_expected_api_key`, `_check_auth`); `gateway/config_env.py:111-113` |
+| `POST /v1/runs` with `{"input": "<prompt>"}` → 202 `{"run_id": "run_…", "status": "started"}` | `gateway/platforms/api_server_runs.py:285-292,768-860`; observed |
+| `GET /v1/runs/{id}/events` is SSE: `data: {"event", "run_id", "timestamp", "seq", …}`, `: keepalive` comments. Seen: `tool.started {tool, preview, tool_call_id}`, `approval.request {kind, prompt_id, execution_generation, command, description, choices}`, `approval.settled {prompt_id}`, `tool.completed {tool, duration, error}`, `message.delta {delta}`, `run.completed {output, usage: {input_tokens, output_tokens, total_tokens}, runtime}` | `api_server_runs.py:224-226` (`_run_event`), `:1256` (`_handle_run_events`); observed |
+| Answer: `POST /v1/runs/{id}/approval` with exactly `{"request_id": <prompt_id>, "execution_generation": <n>, "choice": "once"\|"session"\|"always"\|"deny"}` → `{"status": "resolved"}`; any other key set → 400 `invalid_params` | `gateway/platforms/api_server_authority_runs.py:114-136` (`respond_run`); observed |
+| Whether a command asks: `approvals.mode` (`smart` by default: a guardian model decides and escalates; `manual` always asks for dangerous commands); one-shot `hermes chat` runs use `approvals.single_query_mode` (`deny`), which is why McBot's runs today never ask | `hermes_cli/config_defaults.py:1646-1662` |
+| A run's tools come from `platform_toolsets.api_server`, not `cli`; unset = Hermes' API default (the CLI default minus `clarify`, `computer_use`, `tts`). So compile writes chosen abilities to both surfaces | `gateway/platforms/api_server.py:2196,2215` (`_get_platform_tools(user_config, "api_server")`); `hermes_cli/tools_config.py:572-582`; observed (`web_search` offered while only `cli` was set) |
+| `tool.completed` carries `preview` (the result, secret-redacted, at most 500 characters) — on the admitted-turn path only after McBot's patch passes `result=` on (`hermes/MCBOT.md`); `duration` is 0 there, so McBot times the tool itself | `gateway/platforms/api_server_runs.py:142-157,386-388,1126-1130` |
+| The run's session lands in the profile's `state.db` with source `api_server`; `GET /v1/runs/{id}` gives its `session_id`, so cost reads it as before | `api_server.py:1601` (`_SESSION_SOURCE`); observed |
+| McBot keeps the key and port in `<workspace>/gateway.json` (owner-only; port picked free once) and writes `API_SERVER_KEY/PORT/HOST` into the root's and every profile's `.env` key block | `engine/hermesRuns.ts` (`gatewayApi`, `apiEnv`) |
+| A port another process holds parks the API server ("Port … already in use") while the gateway keeps running | observed in `gateway.log` |
+| `POST /v1/runs` takes `instructions`: the agent's `ephemeral_system_prompt`, added to the system prompt at call time only and never cached or stored in the conversation. McBot sends each chat run what is true right now about the agent's tasks this way (`src/harness/liveContext.ts`) | `gateway/platforms/api_server_runs.py:497-499,873`; `agent/chat_completion_helpers.py:2096-2097`; `agent/system_prompt.py:806`; `agent/turn_context.py:1456` |
+| The agent's questions (the `clarify` tool) on the runs API: the run's SSE stream forwards approval prompts only, so a client reads questions from `GET /v1/runs/<id>` → `pending_controls`, entries `{kind: "clarify", prompt_id, execution_generation, question, choices, multi_select, timeout_s?}` (one per question, asked one after another), and answers with `POST /v1/runs/<id>/clarify {request_id, execution_generation, answer}`: a choice as given ("(Recommended)" marks the first; stripped tool-side), several as a JSON array string, free text, or "" to skip. Unanswered, Hermes stops waiting after `agent.clarify_timeout` (default 90 s) and the agent goes on. On a non-local surface the question ends with a typed-skip hint in Hermes' language, which McBot drops. Hermes' api_server default toolset leaves out clarify, computer use and speech ("no interactive UI tools"), so McBot pins `platform_toolsets.api_server` to the board's abilities | `gateway/session_api_turn.py:294-316` (`run_api_turn` sink), `:377` (`_CONTROL_EVENTS`); `gateway/platforms/api_server_authority_runs.py:67-98` (`run_projection`), `:114-136` (`respond_run`); `gateway/session_pending_controls.py:39-51` (`register_clarify`), `:94-102` (answer); `gateway/platforms/api_server_runs.py:290`; `tools/clarify_tool.py:14-47`; `tools/clarify_gateway.py:281-292` (`resolve_clarify_timeout`); `gateway/run_turn_runner.py:683-686` (skip hint); `toolsets.py:191-194` (`hermes-api-server`); observed: E2E "shows the agent's question and gives it the person's answer"; unpinned, `clarify` "is not available in this execution context" |
+| While the gateway drains for a restart, `POST /v1/runs` answers 503 `gateway_draining` ("Gateway is draining existing work; retry shortly.", `Retry-After: 1`), and a turn already admitted can be refused `runtime_draining`. McBot sends such a run again, up to a minute, when it was refused before it said or did anything (`engine/runner.ts` `GATEWAY_BUSY`) | `gateway/platforms/api_server.py:1183-1189` (`_draining_response`); `gateway/session_api_turn.py:55`; `gateway/restart_when_idle.py:1-14` |
+
+## Things that differ from what we were told
+
+| Claim | Reality |
+|---|---|
+| "model → `models:` key" | Hermes has no top-level `models:`; per-provider `providers.<name>.models` exists but is optional. Not written. |
+| `--source <tag>` is free-form (help text) | Upstream accepts only its own labels (`gateway/session_policy.py` `SURFACES`, `tui_gateway/contracts/canonical_sessions.py`). Our fork adds `mcbot` (`hermes/MCBOT.md`), so McBot's own Hermes runs with `--source mcbot`; an external Hermes gets no `--source` and records `oneshot`. |
+| Hermes docs: MCP tools are `mcp_<server>_<tool>` (`website/docs/user-guide/features/mcp.md:574`) | Code registers `mcp__<server>__<tool>` (`tools/mcp_tool_schema.py:159`, `MCP_TOOL_NAME_PREFIX`); the doc is still stale at v0.23.1. |
+| `${workspaceFolder}` resolves to the session workspace | MCP servers start when the gateway boots, so it resolves to the gateway's own directory. The Files preset uses an absolute folder. |
+| `hermes chat` is a plain CLI process | It auto-starts one multiplex **gateway** per Hermes root (`gateway.pid` JSON, idle-exit after 600 s) that also turns the root into a "default" profile home. The gateway re-scans config on change but discovers MCP servers **only at boot**, so after a config change the engine runs `hermes gateway stop` and waits for the pid to exit — a run started mid-teardown fails with "Gateway starting: deadline". Only done for McBot's own root, never an external `~/.hermes`. |
+| A key in a run's environment reaches the agent | The gateway serves every profile of a root and reads a served profile's keys from **`<profile>/.env` only**; a miss never falls back to the gateway's environment (`agent/secret_scope.py:230-247` `get_secret`, `:407-417` `build_profile_secret_scope`; `gateway/session_local.py:205-218`). Observed: a cloud model's saved key arrived as `Bearer no-key-required`. The engine now writes the keys an agent names into its `.env` before each run (`engine/profileEnv.ts`); the same holds for any setting Hermes reads with `get_secret`, e.g. `OPENAI_BASE_URL`. |
+| A chat app needs `hermes gateway setup` or a platform switch in config | A served profile's bot starts when its `.env` has the platform token: Telegram is enabled by `TELEGRAM_BOT_TOKEN` (`plugins/platforms/telegram/gateway_env.py:12-19`). Under the multiplex gateway every profile gets its own adapters, started under its own home and secret scope (`gateway/run_adapters.py:974-1024`; `website/docs/developer-guide/multiplexing-gateway.md` "Per-credential bot, no route"). Who may talk to it is `TELEGRAM_ALLOWED_USERS` (comma-separated numeric ids), read from **that profile's** scope (`gateway/platforms/_shared.py:69-86` `platform_gate_env`); with no list, unknown senders are refused (`gateway/run_startup.py:1095-1110`). A changed `config.yaml` or `.env` reconnects that profile's adapters (`gateway/run_profile_reconcile.py:50-65`). Observed end to end against a stub Bot API: the allowed user got the agent's answer, another user got nothing. |
+| A gateway with a chat app stops when idle | An idle-exit gateway stays up while any messaging adapter is configured or connected (`gateway/run_idle_exit.py:1-20`). `hermes gateway ensure` starts one without idle exit, as Hermes' desktop app does (`hermes gateway ensure --help`; `hermes_cli/gateway_runtime_start.py:43-61`). The engine runs it after a compile, a saved key, a board save and at start, whenever a compiled agent has a bot with a saved token. |
+| A system proxy honours `NO_PROXY` for a custom Telegram `base_url` | Upstream matched `NO_PROXY` against `api.telegram.org` and its fallback IPs only (`resolve_proxy_url` in `plugins/platforms/telegram/adapter.py`), so a local Bot API server went through `HTTPS_PROXY`. **Fixed in our fork** (`hermes/MCBOT.md`): with a `base_url`, its host is the one checked. The e2e test runs with the sandbox's proxy set and passes. |
+| Installing Hermes from a wheel | Refused by design; supported: installer, Docker, Nix, or the dev checkout (`scripts/run-in-hermes-env`). |
+
+## McBot's own Hermes (hermes/)
+
+| Fact | Source |
+|---|---|
+| A checkout runs through `scripts/run-in-hermes-env CMD…`: it checks the environment and, when stale, runs `setup-hermes.sh --runtime-only` before exec'ing CMD | `hermes/scripts/run-in-hermes-env`, `hermes/scripts/_activation.sh:25-31,117-126` |
+| Tools (Python, uv, Node, ripgrep…) live in a store: `HERMES_RUNTIME_DIR`, else `<repo>/../tools`, else `$HERMES_HOME/tools`; a `python-*` dir there means the runtime exists | `hermes/scripts/_activation.sh:34-48` (`hermes_bootstrap_python`) |
+| A launch that carries `__HERMES_ACTIVATED` (a current activation) skips the check: 2.6 s → 0.2 s per launch, measured | `_activation.sh:85-115` (`hermes_activation_current`); observed |
+| The installed environment is registered per Hermes home (`<home>/installs/<hash>/facts.json`), so activation is per home; a fresh home without one fails with "no dependency environment is committed for this install" | observed |
+| `HERMES_MANAGED=<name>` marks a package-managed install: `hermes update` refuses with a message naming it | `hermes/hermes_constants.py:854-876` (`get_managed_system`); `hermes/hermes_cli/main.py:2199` |
+| …and a managed install does not create or secure its home's folders (`cron`, `sessions`, `logs`, `memories` must exist) | `hermes/hermes_cli/config_home.py:56-66` (`initialize_home`). So McBot's runs never set it; only `npm run cli` does |
+| `python -m pm.environments --format json` (cwd = the checkout, `PYTHONPATH` = the checkout) prints the full environment for the current `HERMES_HOME`; its `PYTHONPATH` lists `<home>/installs/…/site-packages` only once that home has dependencies. McBot launches Hermes' Python with it, no bash runner | `hermes/pm/environments.py:594`; observed |
+| `setup-hermes.sh --runtime-only` / `setup-hermes.ps1 -RuntimeOnly` installs tools into the store and dependencies for the current `HERMES_HOME` | `hermes/setup-hermes.sh:20-26`, `hermes/setup-hermes.ps1:15,100`; observed |
+| A new home's gateway can take longer to boot than the client waits: the run fails with "Gateway starting: deadline", the next one succeeds | `hermes_cli/gateway_chat.py`; observed in the installed app |
+| `hermes_cli/_version.py` is generated by releases, so a checkout reports `vunknown`; McBot shows the upstream commit from `hermes/UPSTREAM.json` | `hermes/.gitignore`; observed |
+
+## Not verified here
+
+- **A real model.** No model host was reachable from the build machine, so every
+  run used `test/stub-llm/` — a deterministic OpenAI-compatible server. It proves
+  the compiled profile is read, routed to the configured endpoint, and that
+  tools, memory and cost flow through real Hermes. Point a model node at Ollama
+  (`http://127.0.0.1:11434/v1`) or LM Studio to see a real answer.
+- **The cron, approvals and memory-config mappings** are verified as paths/keys
+  but not compiled: those node kinds are not in M0–M4. `cron/jobs.json` holds
+  scheduler state (`next_run_at`, `pending_slot`), so schedules should be
+  created through `hermes cron add`, not by writing the file.
+- **Windows and macOS.** Built and run on Linux only (`cargo check`, a debug
+  Tauri build under Xvfb). The Hermes binary lookup handles `.cmd` shims and
+  `PATHEXT`, untested on Windows.
+
+## Chat apps (every platform plugin)
+
+| Fact | Source |
+|---|---|
+| Each gateway platform is a plugin with `plugin.yaml`: `label`, `requires_env` (`name`, `prompt`, `url`, `password: true` for secrets) and `optional_env` (including `<P>_ALLOWED_USERS`). McBot's list is generated from these files, not typed by hand | `hermes/plugins/platforms/*/plugin.yaml`; `scripts/hermes-platforms.ts` |
+| A served profile's platform credentials are read from that profile's `.env` (as Telegram's) | `plugins/platforms/<p>/gateway_env.py`; `agent/secret_scope.py:230-247` |
+| `a2a` declares no required variable (configured elsewhere) and is left out; `yuanbao` has no `plugin.yaml` | `hermes/plugins/platforms/a2a/plugin.yaml` |
+| Only Telegram is verified end to end (stub Bot API, `engine/engine.test.ts`); other apps are written exactly as their plugin declares and not run in tests | — |
+
+## Tasks belong to a board (kanban tenant)
+
+| Fact | Source |
+|---|---|
+| `hermes kanban create --tenant <ns>` sets the task's `tenant` ("Tenant namespace"); the column is indexed | `hermes_cli/kanban_parser.py:84,177`; `hermes_cli/kanban_db.py:797`; `kanban_db_connect.py:951` |
+| A child task inherits its parent's tenant unless one is given | `hermes_cli/kanban_db_graph.py:27-48` (`initial_task_state`) |
+| The dispatcher gives the worker `HERMES_TENANT`, and `kanban_create` from inside a task defaults to it | `kanban_db_dispatch.py:2809-2810`; `tools/kanban_tools.py:1135` |
+| McBot creates every task with `--tenant mcbot-<boardId>` and shows a board only its own; tasks with no tenant keep the old rule (this board's agents, or unassigned) | `engine/kanban.ts` (`boardTenant`, `readTasks`) |
+
+## Tool sets McBot added, and Hermes' connector catalog
+
+| Fact | Source |
+|---|---|
+| Tool set keys `video` (video_analyze), `x_search`, `context_engine` exist and work on `cli`/`api_server`; `video` and `x_search` are off by default (`_DEFAULT_OFF_TOOLSETS`); `discord`/`discord_admin` are dropped outside Discord, so McBot does not offer them | `hermes_cli/tools_config.py:69-95,111` |
+| Hermes' vetted MCP catalog: `optional-mcps/<name>/manifest.yaml` (`transport.type: http`, `url`, `auth.type: oauth\|none\|api_key`, optional `auth.oauth`). McBot generates its Connectors from the http + oauth/none entries (`npm run engine:connectors`) | `hermes_cli/mcp_catalog.py:43,198-213` |
+| An OAuth connector compiles to `mcp_servers.<name>: {url, auth: oauth, oauth: {…}}`, as Hermes' own catalog writes it; the MCP client reads `auth` case-insensitively | `hermes_cli/mcp_catalog.py:549-554`; `tools/mcp_tool_server_run.py:263` |
+| `hermes -p <agent> mcp login <name> --flow browser` signs in to an OAuth server (opens the system browser, waits for the callback); the tokens are read when the gateway next connects its MCP servers | `hermes_cli/subcommands/mcp.py:47-52`; `hermes_cli/mcp_config.py:972` |
+
+## Model providers McBot offers as presets
+
+| Fact | Source |
+|---|---|
+| OpenCode Zen: base `https://opencode.ai/zen/v1`, key variable `OPENCODE_ZEN_API_KEY`, base override `OPENCODE_ZEN_BASE_URL`. Hermes has no keyless mode for it. Whether Zen's free models answer without a key is **not verified** (the build sandbox could not reach opencode.ai). | `hermes_cli/auth.py:223`; `plugins/model-providers/opencode-zen/__init__.py:132` |
+| OpenCode Go (OpenCode's flat-price subscription): base `https://opencode.ai/zen/go/v1`, key variable `OPENCODE_GO_API_KEY` (McBot's preset uses the same name). Some of its models answer only on `/v1/responses`; McBot's OpenAI-compatible endpoint uses chat completions, so pick one that answers there. | `hermes_cli/auth.py:227` |
+| Hermes' planning tool is `todo_list` (legacy `todo`), args `{todos: [{id, content, status: pending\|in_progress\|completed\|cancelled, parent?}], merge?}`; every call returns the whole list as JSON `{"todos": [...], ...}`. McBot draws the newest list as the agent's plan in Chat (`src/app/chat/plan.ts`) | `tools/todo_tool.py:229` (`TODO_SCHEMA`), `:9` (`VALID_STATUSES`), `todo_tool` return |
+| Trajectories: `save_trajectory` writes `{"conversations": [{"from": "system"\|"human"\|"gpt"\|"tool", "value"}], "timestamp", "model", "completed"}` JSONL; tool calls are `<tool_call>\n{"name", "arguments"}\n</tool_call>`, results `<tool_response>\n{"tool_call_id", "name", "content"}\n</tool_response>`. McBot's Learn export "Hermes" writes the same shape from its own run record (`src/harness/learn.ts` `toShareGpt`); Hermes' own `--save-trajectories` stays off | `agent/trajectory.py:93-98`; `agent/agent_runtime_helpers.py` `convert_to_trajectory_format`, `_trajectory_tool_call_turn`, `_trajectory_tool_responses` |
+| Sandboxes: `terminal.backend` (default `local`; container backends in `tools/environments/`: docker, modal, daytona, ssh, vercel_sandbox). **Not compiled by McBot yet** (docs/TRAINING.md, step 3) | `hermes_cli/config_defaults.py:286`; `tools/environments/` |

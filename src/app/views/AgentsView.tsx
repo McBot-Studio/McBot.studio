@@ -1,0 +1,354 @@
+import { starterPrompts } from "../chat/starters";
+import { ArrowUp, Download, PanelRight, Plug, Plus, Square, Waypoints, X, ThumbsUp, ThumbsDown, ListChecks, Check, LoaderCircle } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { AgentNode, ModelData } from "../../contracts/graph";
+import type { RunEvent, RunSummary } from "../../contracts/run";
+import { resolveGraph } from "../../compile";
+import { rateRun, runAgent, stopRun } from "../actions";
+import { engine, REMOTE } from "../lib/engine";
+import { duration, plainLine, tokens, usd } from "../lib/format";
+import { Sidebar } from "../shell/Sidebar";
+import { useBoard } from "../state/board";
+import { useApp } from "../state/store";
+import { AgentFace, Empty } from "../ui";
+import { toolLabel } from "../lib/toolLabel";
+import { ApprovalCard } from "../approvals/ApprovalCard";
+import { QuestionCard } from "../approvals/QuestionCard";
+import { screenCaptures } from "../chat/screen";
+import { RichText } from "../chat/RichText";
+import { AgentPage } from "../agent/AgentPage";
+import { ModelChip } from "../graph/Logo";
+import { isPlanStep, planOf, type PlanItem } from "../chat/plan";
+
+function shortTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function dayLabel(ts: number): string {
+  const d = new Date(ts);
+  const today = new Date();
+  const yesterday = new Date(Date.now() - 86_400_000);
+  const same = (a: Date, b: Date) => a.toDateString() === b.toDateString();
+  const day = same(d, today) ? "Today" : same(d, yesterday) ? "Yesterday" : d.toLocaleDateString([], { month: "short", day: "numeric" });
+  return `${day} ${shortTime(ts)}`;
+}
+
+/** Images and videos a run made: Hermes' image_generate / video_generate results ({ image } / { video }). */
+export function madeMedia(events: RunEvent[] | undefined): { kind: "image" | "video"; path: string; seq: number }[] {
+  const out: { kind: "image" | "video"; path: string; seq: number }[] = [];
+  for (const e of events ?? []) {
+    if (e.type !== "run.tool.finished" || e.isError) continue;
+    try {
+      const r = JSON.parse(e.output) as { success?: boolean; image?: unknown; video?: unknown };
+      if (r.success === false) continue;
+      // Local files only: a bare provider URL would load from the internet, which the app does not allow.
+      for (const kind of ["image", "video"] as const) {
+        const p = r[kind];
+        if (typeof p === "string" && !/^[a-z]+:\/\//i.test(p)) out.push({ kind, path: p, seq: e.seq });
+      }
+    } catch {
+      // not JSON: not a media result
+    }
+  }
+  return out;
+}
+
+/** The agent's screen: the latest capture while it works ("Live"), every step to scrub through after. */
+function Screen({ profile, shots, live }: { profile: string; shots: { path: string; seq: number; action: string }[]; live: boolean }) {
+  const [at, setAt] = useState<number | null>(null);
+  const i = live || at === null ? shots.length - 1 : Math.min(at, shots.length - 1);
+  const shot = shots[i]!;
+  return (
+    <div className="screen" data-testid="agent-screen">
+      <div className="screen-head">
+        {live ? <span className="chip run screen-live"><i /> Live</span> : <span className="chip">Screen</span>}
+        <span className="faint ellipsis grow">{shot.action || "capture"}</span>
+        <span className="faint num">{i + 1}/{shots.length}</span>
+      </div>
+      <Made key={shot.path} profile={profile} kind="image" path={shot.path} />
+      {!live && shots.length > 1 && <input type="range" min={0} max={shots.length - 1} value={i} onChange={(e) => setAt(Number(e.target.value))} aria-label="Step" />}
+    </div>
+  );
+}
+
+/** One made image or video, fetched from the engine (read-only, inside the agent's folder). */
+function Made({ profile, kind, path }: { profile: string; kind: "image" | "video"; path: string }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    let made: string | null = null;
+    engine.media(profile, path).then((b) => {
+      made = URL.createObjectURL(b);
+      if (alive) setUrl(made);
+      else URL.revokeObjectURL(made);
+    }).catch(() => { if (alive) setFailed(true); });
+    return () => {
+      alive = false;
+      if (made) URL.revokeObjectURL(made);
+    };
+  }, [profile, path]);
+  const file = path.split(/[\\/]/).pop() ?? "";
+  if (failed) return <div className="made missing faint" data-tip={path} data-tip-side="top">{file}</div>;
+  if (!url) return <div className="made loading" />;
+  return (
+    <div className="made" data-testid="made-media">
+      {kind === "image" ? <img src={url} alt="" /> : <video src={url} controls />}
+      <a className="icon-btn sm made-save" href={url} download={file} aria-label="Save" data-tip="Save" data-tip-side="top"><Download size={13} /></a>
+    </div>
+  );
+}
+
+/** Thumbs up or down on an answer: what Learn trains on (a second click takes it back). */
+function Rate({ runId }: { runId: string }) {
+  const rating = useApp((s) => s.ratings[runId]);
+  const pick = (score: 0 | 1) => void rateRun(runId, rating?.score === score ? null : score);
+  return (
+    <span className="rate" role="group" aria-label="Rate this answer">
+      <button type="button" className="rate-btn" aria-pressed={rating?.score === 1} aria-label="Good answer" data-tip="Good answer: train on it" data-tip-side="top" onClick={() => pick(1)} data-testid="rate-up"><ThumbsUp size={13} /></button>
+      <button type="button" className="rate-btn" aria-pressed={rating?.score === 0} aria-label="Bad answer" data-tip="Not good: leave it out" data-tip-side="top" onClick={() => pick(0)} data-testid="rate-down"><ThumbsDown size={13} /></button>
+    </span>
+  );
+}
+
+/** An agent's answer: its steps, screen, approval, text and what it made. Also a guest's chat (`waitingFor`: the host). */
+/** The agent's plan (Hermes' to-do tool), live: what is done, what it is on, what comes next. */
+function Plan({ items, live }: { items: PlanItem[]; live: boolean }) {
+  const done = items.filter((i) => i.status === "completed").length;
+  return (
+    <div className="plan" data-testid="agent-plan">
+      <div className="plan-head"><ListChecks size={13} /><b>Plan</b><span className="faint num">{done} of {items.filter((i) => i.status !== "cancelled").length}</span></div>
+      <ol className="plan-items">
+        {items.map((i) => (
+          <li key={i.id} data-status={i.status} className={i.parent ? "sub" : undefined}>
+            <span className="plan-mark" aria-hidden>
+              {i.status === "completed" ? <Check size={11} strokeWidth={3} /> : i.status === "in_progress" && live ? <LoaderCircle size={12} className="spin-icon" /> : i.status === "cancelled" ? <X size={11} /> : null}
+            </span>
+            <span className="plan-text">{i.content}</span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+export function AgentMessage({ run, events, name, onChoose, waitingFor }: { run: RunSummary; events: RunEvent[] | undefined; name: string; onChoose?: (reply: string) => void; waitingFor?: string }) {
+  const plan = planOf(events);
+  const tools = (events ?? []).filter((e): e is Extract<RunEvent, { type: "run.tool.started" }> => e.type === "run.tool.started" && !isPlanStep(e));
+  const failedTools = new Set((events ?? []).filter((e) => e.type === "run.tool.finished" && e.isError).map((e) => (e.type === "run.tool.finished" ? e.tool : "")));
+  const text = (run.text || "").trim();
+  const failed = run.status === "failed" || run.status === "interrupted";
+  const made = madeMedia(events);
+  const shots = screenCaptures(events);
+  return (
+    <div className={`msg agent${failed ? " failed" : ""}`} data-testid="agent-message">
+      <div className="from"><AgentFace seed={run.profile} size={18} status={run.status} /><b>{name}</b></div>
+      {tools.length > 0 && (
+        <div className="steps">
+          {tools.map((t) => <span key={t.seq} className={`step-chip${failedTools.has(t.tool) ? " fail" : ""}`} data-tip={t.tool}><Plug size={11} /><span>{toolLabel(t.tool)}</span></span>)}
+        </div>
+      )}
+      {plan && plan.length > 0 && <Plan items={plan} live={run.status === "running"} />}
+      {shots.length > 0 && <Screen profile={run.profile} shots={shots} live={run.status === "running"} />}
+      <ApprovalCard run={run} waitingFor={waitingFor} />
+      <QuestionCard run={run} />
+      {run.status === "running" && !text ? (
+        run.approval || run.question ? null : <div className="bubble" style={{ padding: 0 }}><span className="typing"><i /><i /><i /></span></div>
+      ) : (
+        failed && !text ? <div className="bubble" data-testid="agent-text">{run.error ?? "Failed"}</div>
+          : <div className="bubble"><RichText text={text} onChoose={run.status === "running" ? undefined : onChoose}
+            image={(src, alt) => /^[a-z]+:\/\//i.test(src) ? <span className="faint" data-tip={src}>{alt || "image"}</span> : <Made profile={run.profile} kind="image" path={src} />} /></div>
+      )}
+      {made.length > 0 && <div className="made-grid">{made.map((m) => <Made key={`${m.seq}-${m.kind}`} profile={run.profile} kind={m.kind} path={m.path} />)}</div>}
+      {run.status !== "running" && (
+        <div className="meta num">
+          {run.finishedAt && <span>{duration(run.finishedAt - run.startedAt)}</span>}
+          {run.tokens && <span>{tokens(run.tokens.total)} tokens</span>}
+          {(run.reportedUsd || run.estimatedUsd) ? <span>{usd(run.reportedUsd || run.estimatedUsd)}</span> : null}
+          {!waitingFor && REMOTE?.role !== "chat" && <Rate runId={run.runId} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Thread({ agent, model, info, onInfo }: { agent: AgentNode; model: string | null; info: boolean; onInfo: () => void }) {
+  const { boardId } = useBoard();
+  const runs = useApp((s) => s.runs);
+  const events = useApp((s) => s.events);
+  const loadEvents = useApp((s) => s.loadEvents);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const scroller = useRef<HTMLDivElement>(null);
+  const box = useRef<HTMLTextAreaElement>(null);
+  // The box grows with what is typed and shrinks back once it is sent (or cleared).
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    el.style.height = "auto";
+    if (draft) el.style.height = `${Math.min(200, el.scrollHeight)}px`;
+  }, [draft]);
+  const name = agent.data.displayName || agent.data.name;
+
+  const thread = useMemo(() => Object.values(runs).filter((r) => r.agentNodeId === agent.id).sort((a, b) => a.startedAt - b.startedAt), [runs, agent.id]);
+  const running = thread.find((r) => r.status === "running");
+  const textLen = thread.reduce((n, r) => n + r.text.length, 0);
+  const asking = thread.filter((r) => r.approval || r.question).length;
+
+  useEffect(() => {
+    for (const r of thread) if (!events[r.runId]) engine.run(r.runId).then((e) => loadEvents(r.runId, e)).catch(() => undefined);
+  }, [thread.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" });
+  }, [thread.length, textLen, asking]);
+
+  const queued = useApp((s) => s.queue[agent.id]);
+  const send = async () => {
+    const prompt = draft.trim();
+    if (!prompt) return;
+    setDraft("");
+    await ask(prompt);
+  };
+  /** Ask the agent (the composer, or a reply button): straight away, or in the queue while it works. */
+  const ask = async (prompt: string) => {
+    // Busy, starting, or others are waiting: it goes in the queue and is sent when the agent is free.
+    if (running || sending || useApp.getState().starting[agent.id] || queued?.items.length) {
+      useApp.getState().enqueue(agent.id, prompt);
+      setDraft("");
+      return;
+    }
+    setSending(true);
+    setDraft("");
+    const id = await runAgent(boardId, agent.id, prompt);
+    if (!id) setDraft(prompt);
+    setSending(false);
+  };
+
+  let lastDay = "";
+  return (
+    <div className="thread page-enter">
+      <div className="thread-head">
+        <button className="thread-who" onClick={onInfo} data-tip={info ? undefined : "Its settings"} data-testid="thread-who">
+          <AgentFace seed={agent.data.name} size={30} status={running ? "running" : thread.at(-1)?.status} />
+          <span className="name">{name}</span>
+        </button>
+        <span className="grow" />
+        {model && <ModelChip model={model} />}
+        <button className="icon-btn" aria-label={info ? "Hide its settings" : "Show its settings"} aria-pressed={info} data-tip={info ? "Hide settings" : "Settings"} onClick={onInfo} data-testid="agent-info"><PanelRight size={16} /></button>
+      </div>
+      <div className="thread-scroll" ref={scroller}>
+        <div className="thread-inner" data-testid="thread">
+          {thread.length === 0 && (
+            <div className="empty" style={{ height: "auto", paddingTop: 80 }}>
+              <AgentFace seed={agent.data.name} size={72} />
+              <h3>{name}</h3>
+              <p>{agent.data.description || "Ask anything."}</p>
+              <div className="rich-choices starters" data-testid="starters">
+                {starterPrompts(agent.data.displayName || agent.data.name, agent.data.description).map((q) => (
+                  <button key={q} className="rich-choice" onClick={() => void ask(q)}>{q}</button>
+                ))}
+              </div>
+            </div>
+          )}
+          {thread.map((r) => {
+            const day = new Date(r.startedAt).toDateString();
+            const sep = day !== lastDay ? <div className="day">{dayLabel(r.startedAt)}</div> : null;
+            lastDay = day;
+            return (
+              <div key={r.runId} style={{ display: "grid", gap: 14 }}>
+                {sep}
+                <div className="msg user">{r.byName && <span className="msg-by" data-testid="msg-by">{r.byName}</span>}<div className="bubble">{r.prompt}</div></div>
+                <AgentMessage run={r} events={events[r.runId]} name={name} onChoose={r === thread.at(-1) ? (reply) => void ask(reply) : undefined} />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div className="composer-wrap">
+        {queued && queued.items.length > 0 && (
+          <div className="queue" data-testid="queue">
+            {queued.items.map((q, i) => (
+              <div key={`${i}-${q}`} className="queue-item">
+                <span className="queue-n num">{i + 1}</span>
+                <span className="grow ellipsis">{q}</span>
+                <button className="icon-btn sm" aria-label="Remove from queue" data-tip="Remove" onClick={() => useApp.getState().unqueue(agent.id, i)}><X size={12} /></button>
+              </div>
+            ))}
+            {queued.paused && (
+              <div className="queue-paused"><span className="grow">Paused: the first one couldn't start</span>
+                <button className="btn sm" onClick={() => useApp.getState().resumeQueue(agent.id)}>Try again</button></div>
+            )}
+          </div>
+        )}
+        <div className="composer">
+          <textarea rows={1} value={draft} placeholder={running ? `Queue a message for ${name}` : `Message ${name}`} data-testid="composer"
+            ref={box} onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }} />
+          {running && <button className="send stop" aria-label="Stop" data-tip="Stop" onClick={() => void stopRun(running.runId)}><Square size={12} /></button>}
+          {(!running || draft.trim()) && <button className="send" aria-label={running ? "Queue" : "Send"} data-tip={running ? "Sends when it's free" : undefined} disabled={!draft.trim()} onClick={send} data-testid="send"><ArrowUp size={16} /></button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function AgentsView() {
+  const { graph } = useBoard();
+  const runs = useApp((s) => s.runs);
+  const chatAgentId = useApp((s) => s.chatAgentId);
+  const openChat = useApp((s) => s.openChat);
+  const info = useApp((s) => s.agentInfo);
+  const setInfo = useApp((s) => s.setAgentInfo);
+  const setTab = useApp((s) => s.setTab);
+  const [q, setQ] = useState("");
+  const { bundles } = useMemo(() => resolveGraph(graph), [graph]);
+  const agents = graph.nodes.filter((n): n is AgentNode => n.kind === "agent");
+  const last = useMemo(() => {
+    const m = new Map<string, RunSummary>();
+    for (const r of Object.values(runs)) if (!m.get(r.agentNodeId) || m.get(r.agentNodeId)!.startedAt < r.startedAt) m.set(r.agentNodeId, r);
+    return m;
+  }, [runs]);
+  const current = agents.find((a) => a.id === chatAgentId) ?? agents[0] ?? null;
+  const modelOf = (id: string) => {
+    const m = bundles.find((b) => b.agent.id === id)?.models[0];
+    return m ? (m.data as ModelData).model || null : null;
+  };
+  const shown = agents
+    .filter((a) => `${a.data.name} ${a.data.displayName}`.toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => (last.get(b.id)?.startedAt ?? 0) - (last.get(a.id)?.startedAt ?? 0));
+
+  return (
+    <>
+      <Sidebar title="Agents" search={q} onSearch={setQ} testId="agents-sidebar" action={<button className="icon-btn sm" aria-label="New agent" data-tip="New agent" onClick={() => useApp.getState().setNewAgentOpen(true)} data-testid="agents-new"><Plus size={14} /></button>}>
+        {shown.map((a) => {
+          const r = last.get(a.id);
+          const preview = r ? (r.status === "running" ? "Working…" : plainLine(r.text || r.error || r.prompt)) : a.data.description || "No messages yet";
+          return (
+            <button key={a.id} className="list-row" aria-selected={current?.id === a.id} onClick={() => openChat(a.id)} style={{ alignItems: "flex-start", padding: "10px" }} data-testid="agent-row">
+              <AgentFace seed={a.data.name} size={38} status={r?.status} />
+              <span className="grow" style={{ display: "grid", gap: 3 }}>
+                <span className="row" style={{ gap: 6 }}>
+                  <span className="title ellipsis">{a.data.displayName || a.data.name}</span>
+                  <span className="time">{r ? shortTime(r.startedAt) : ""}</span>
+                </span>
+                <span className="sub ellipsis" style={r?.status === "running" ? { color: "var(--run-text)" } : undefined}>{preview}</span>
+              </span>
+            </button>
+          );
+        })}
+      </Sidebar>
+      <section className="main chat-main">
+        {current ? (
+          <div className="chat-split" data-info={info || undefined}>
+            <Thread key={current.id} agent={current} model={modelOf(current.id)} info={info} onInfo={() => setInfo(!info)} />
+            {info && <aside className="agent-pane" aria-label={`${current.data.displayName || current.data.name}: settings`}><AgentPage key={current.id} agent={current} where="chat" onClose={() => setInfo(false)} /></aside>}
+          </div>
+        ) : (
+          <Empty title="No agents yet" action={<button className="btn light" onClick={() => useApp.getState().setNewAgentOpen(true)}><Plus size={14} /> New agent</button>}>
+            Add an agent on the graph, compile, then talk to it here.
+          </Empty>
+        )}
+      </section>
+    </>
+  );
+}

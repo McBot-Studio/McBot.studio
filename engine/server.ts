@@ -1,0 +1,1446 @@
+/**
+ * The McBot engine: one local process that is the board relay (M2), the
+ * compile writer (M1), the run launcher (M3) and the reader of Hermes data
+ * (M4). Loopback only. No auth in v0, so every request must come from an
+ * allowed Origin and a loopback Host: a web page in the user's browser must
+ * not be able to compile or launch agents (cross-site request / DNS rebinding).
+ */
+import { randomBytes } from "node:crypto";
+import { createReadStream, existsSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { ChildProcess } from "node:child_process";
+import type { AddressInfo } from "node:net";
+import { basename, join, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { WebSocketServer } from "ws";
+import { z } from "zod";
+import { compile, resolveGraph, type AgentBundle } from "../src/compile";
+import { updateChecker } from "./updates";
+import { askForPlan, plannerModel } from "./builder";
+import { PlanChoicesSchema, type HarnessPlan } from "../src/harness/plan";
+import type { AgentMemoryView, GuestView, BoardExport, BoardInfo, CompileResponse, Diagnostics, FsListing, FsPreview, FsRoot, Health, HermesInfo, AgentSchedules, LearnExport, LearnView, SignInView, UpdateView, SetupDetect, SetupState, TaskAction, TaskDetail, TasksView, TaskView } from "../src/contracts/api";
+import { writeExport } from "./boardFiles";
+import { isHermesHome, readSetup } from "./harnessDisk";
+import { HermesSync } from "./hermesSync";
+import { unshownNote, type Unshown } from "../src/harness/read";
+import { addVersion, type HarnessVersion } from "../src/harness/versions";
+import { diagnosticsText, osLine, redact, tail } from "./diagnostics";
+import { PROFILE_NAME_RE as PROFILE_RE, type Graph, type ModelNode } from "../src/contracts/graph";
+import { buildCostReport } from "./cost";
+import { atomicWrite } from "./fsutil";
+import { FILE_MAX_BYTES, FolderError, Folders, browseFolders } from "./folders";
+import { bundledSource, bundledUpstream, findHermes, gatewayStatus, hermesCommand, hermesEnv, prepareHermes, setupHome, stopGateway } from "./hermes";
+import { DOC_MAX_BYTES, docKind, docText, extractWithHermes, freePath, hermesDirOf, safeDocName, saveDoc } from "./knowledge";
+import { MemoryConflict, readMemory, readSessions, readTaskWork, writeMemory } from "./hermesData";
+import { JOB_ID_RE, createScheduleArgv, readSchedules, scheduleActionArgv } from "./schedules";
+import { SEED_ARGV, SKILL_ID_RE, SKILL_NAME_RE, addSkillArgv, bundledSeeded, installArgv, installedSkills, listLibrary, parseSkillSearch, profileSkills, searchSkillsArgv, skillSources, uninstallArgv, updateArgv } from "./skills";
+import { PLUGIN_NAME_RE, disablePluginArgv, enablePluginArgv, installPluginArgv, listPluginCatalog, listPluginsArgv, parsePluginList, removePluginArgv } from "./plugins";
+import { TASK_ID_RE, actionArgv, boardTenant, createArgv, kanbanError, readTask, readTasks, runKanban } from "./kanban";
+import { envEntriesFor, hasLiveChannel, resolveEntries, writeProfileKeys } from "./profileEnv";
+import { MediaError, mediaFile } from "./media";
+import { BOARD_ID_RE, BoardRelay, LooseGraph } from "./relay";
+import { Runner } from "./runner";
+import { HermesRuns, apiEnv, gatewayApi } from "./hermesRuns";
+import { RunStore } from "./runStore";
+import type { RunEvent } from "../src/contracts/run";
+import { SecretError, Secrets } from "./secrets";
+import { SetupStore, detectLocal, listModels } from "./setup";
+import { OwnershipError, readManifest, writeCompileResult } from "./writer";
+import { Sharing, cleanOwnUrl, guestAllowed, joinPage, type Member, type SharingView } from "./sharing";
+import { Tunnel, launchQuickTunnel } from "./tunnel";
+import { LoginError, Logins } from "./logins";
+import { GitHubError, downloadRepo, inspectRepo, parseGitHub } from "./github";
+import { APP_PAGES, hasWebApp, pagePolicy, webFile } from "./webApp";
+import { frameable } from "./web";
+import { Ratings, agentConversations, learnAgent, writeDataset } from "./learn";
+import { MIN_EXAMPLES, TrainError, TrainStore, cancelFineTune, isActive, newTrainId, readFineTune, startFineTune, trainSuffix, type TrainJob } from "./train";
+import type { DatasetFormat, DatasetPick } from "../src/harness/learn";
+import type { Rating } from "../src/harness/learn";
+import { renderSoul } from "../src/compile/soul";
+import { liveContext } from "../src/harness/liveContext";
+
+export const ENGINE_VERSION = "0.9.1";
+
+export interface EngineConfig {
+  workspace: string;
+  hermesHome: string;
+  managedRoot: boolean;
+  port: number;
+  host: string;
+  allowedOrigins: string[];
+  /** The installed app's engine log (the shell writes it), for "Report a problem"; absent in development. */
+  logFile?: string;
+  /** Share: the port people who join connect to while sharing is on (default 4318; 0 = any). */
+  sharePort?: number;
+  /** The built app (`dist/`), served on the share port so people can join in a web browser. */
+  webDir?: string;
+  /** Where McBot keeps tools it downloads (Cloudflare's tunnel client); default <workspace>/.tools. */
+  toolsDir?: string;
+  /** McBot's own data folder, outside the workspace (the installed app's MCBOT_DATA_DIR): the logins' key. */
+  dataDir?: string;
+  /** Tests: start a stand-in for `cloudflared tunnel --url` (engine/tunnel.ts). */
+  launchTunnel?: (port: number) => Promise<ChildProcess>;
+  /** Ask GitHub whether a newer McBot is out (the installed app only; never in tests or dev). */
+  checkUpdates?: boolean;
+}
+
+export const DEFAULT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173", "tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"];
+const LOOPBACK_HOST = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
+/** A plugin on GitHub as Hermes takes it: owner/repo, and a folder in it. */
+const GITHUB_SOURCE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}\/[A-Za-z0-9._-]{1,100}(\/[A-Za-z0-9._-]{1,100}){0,8}$/;
+
+class HttpError extends Error {
+  constructor(readonly status: number, message: string, readonly body?: unknown) {
+    super(message);
+  }
+}
+
+/** A request's raw bytes (a document upload), refused past `max`. */
+async function rawBody(req: IncomingMessage, max: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).length;
+    if (size > max) throw new HttpError(413, `That file is larger than ${Math.round(max / 1_048_576)} MB`);
+    chunks.push(c as Buffer);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function json(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const c of req) {
+    size += (c as Buffer).length;
+    if (size > 2_000_000) throw new HttpError(413, "body too large");
+    chunks.push(c as Buffer);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch {
+    throw new HttpError(400, "invalid JSON");
+  }
+}
+
+function parse<T>(schema: z.ZodType<T>, value: unknown): T {
+  const r = schema.safeParse(value);
+  if (!r.success) throw new HttpError(400, r.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "));
+  return r.data;
+}
+
+const slugOf = (name: string) => name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "board";
+
+export interface Engine {
+  server: Server;
+  url: string;
+  relay: BoardRelay;
+  runner: Runner;
+  store: RunStore;
+  close(): Promise<void>;
+}
+
+export async function startEngine(cfg: EngineConfig): Promise<Engine> {
+  // A saved board edit can change what an agent's .env holds (a bot's allowed users): sync it.
+  let onBoardSaved: (boardId: string) => void = () => undefined;
+  const relay = new BoardRelay(join(cfg.workspace, "boards"), (boardId) => onBoardSaved(boardId));
+  const store = new RunStore(join(cfg.workspace, "runs"));
+  /**
+   * A run that shows as running but has no process here (McBot quit or the engine restarted mid-run):
+   * Stop ends it, so it never stays "running" forever.
+   */
+  const endOrphan = async (runId: string): Promise<boolean> => {
+    const events = await store.events(runId);
+    if (!events.length || events.some((e) => e.type === "run.finished")) return false;
+    store.emit(runId, { type: "run.finished", status: "interrupted", exitCode: null, text: "", tokens: null, durationMs: Date.now() - events[0]!.ts, sessionId: null, error: "Stopped (McBot had restarted during this run)" });
+    return true;
+  };
+  // Nothing runs in a fresh engine: a run still marked running is left from before it started.
+  void store.list().then((runs) => Promise.all(runs.filter((r) => r.status === "running").map((r) => endOrphan(r.runId)))).catch(() => undefined);
+  const secrets = new Secrets(join(cfg.workspace, "secrets.json"));
+  /** Thumbs up / down on answers (Learn). */
+  const ratings = new Ratings(join(cfg.workspace, "ratings.json"));
+  let setupJob: HermesInfo["setup"] = { state: "idle", lines: [] };
+  const setup = new SetupStore(join(cfg.workspace, "setup.json"));
+  // McBot's own Hermes runs through the gateway's runs API, so runs can ask before risky actions.
+  // An external Hermes (MCBOT_HERMES_BIN) keeps one-shot runs: it is not ours to reconfigure.
+  const gateway = cfg.managedRoot ? await gatewayApi(join(cfg.workspace, "gateway.json")) : null;
+  /** Connector sign-ins this engine started, by "<profile>/<connector>" (kept until it quits). */
+  const signIns = new Map<string, SignInView>();
+  const updates = updateChecker(ENGINE_VERSION);
+  const runner = new Runner({
+    store, root: cfg.hermesHome, managedRoot: cfg.managedRoot, findHermes: () => findHermes(), secrets: () => secrets.env(),
+    api: gateway ? { runs: new HermesRuns(gateway), env: apiEnv(gateway) } : undefined,
+  });
+  const folders = new Folders(cfg.workspace, cfg.hermesHome);
+  // "Anyone with the link": a quick tunnel to the share port while sharing reaches the internet.
+  const toolsDir = cfg.toolsDir ?? join(cfg.workspace, ".tools");
+  let tunnel: Tunnel | null = null;
+  const sharing = new Sharing(join(cfg.workspace, "sharing.json"), cfg.sharePort ?? 4318, () => tunnel?.view().url ?? null);
+  // Passwords: the person's logins, sealed with a key kept outside the workspace.
+  const logins = new Logins(join(cfg.workspace, "logins.json"), join(cfg.dataDir ?? join(cfg.workspace, ".data"), "logins.key"));
+  const loginCall = async <T>(f: () => Promise<T>): Promise<T> => {
+    try {
+      return await f();
+    } catch (err) {
+      throw err instanceof LoginError ? new HttpError(err.status, err.message) : err;
+    }
+  };
+  /** A saved GitHub key raises GitHub's hourly limit for Add from GitHub. */
+  const githubToken = async () => {
+    const saved = await secrets.env().catch(() => ({} as Record<string, string>));
+    return saved.GITHUB_TOKEN || saved.GITHUB_PERSONAL_ACCESS_TOKEN || saved.GH_TOKEN || null;
+  };
+  const githubCall = async <T>(f: () => Promise<T>): Promise<T> => {
+    try {
+      return await f();
+    } catch (err) {
+      if (err instanceof GitHubError) throw new HttpError(err.status, err.message);
+      if (err instanceof TypeError || (err as Error).name === "TimeoutError") throw new HttpError(502, "Can't reach GitHub. Is this computer online?");
+      throw err;
+    }
+  };
+  /** Who sent this request on the share port: the member its key belongs to. */
+  const memberOf = new WeakMap<IncomingMessage, Member>();
+  /** Runs someone who joined started, by run id (their member id), for what each guest may see. */
+  const runBy = new Map<string, string>();
+  const allowed = new Set(cfg.allowedOrigins);
+  /** Live events: SSE for McBot's own windows, a WebSocket for windows that joined (quick tunnels carry no SSE). */
+  const sse = new Map<ServerResponse, Member | null>();
+  const eventSockets = new Map<import("ws").WebSocket, Member | null>();
+  /** A guest (Can chat) sees only the runs they started; the host and teammates see every run. */
+  const seesRun = (m: Member | null, runId: string) => !m || m.role === "edit" || runBy.get(runId) === m.id;
+  /** What a guest's window gets of a run: not where it ran on this computer. */
+  const forGuest = (e: RunEvent): RunEvent => (e.type === "run.started" ? { ...e, argv: [], hermesHome: "", cwd: "" } : e);
+  store.subscribe((e) => {
+    if (e.type === "run.started" && e.by) runBy.set(e.runId, e.by);
+    const all = JSON.stringify(e);
+    let guest: string | null = null;
+    const frame = (m: Member | null) => (m?.role === "chat" ? (guest ??= JSON.stringify(forGuest(e))) : all);
+    for (const [res, m] of sse) if (seesRun(m, e.runId)) res.write(`data: ${frame(m)}\n\n`);
+    for (const [ws, m] of eventSockets) if (seesRun(m, e.runId) && ws.readyState === ws.OPEN) ws.send(`{"run":${frame(m)}}`);
+  });
+  // Hermes → the board, live: an agent's files changed (editor, Hermes CLI, or the agent itself).
+  const hermesSync = new HermesSync(cfg.hermesHome, join(cfg.workspace, "hermes-seen.json"), relay, (c) => {
+    const frame = `event: harness\ndata: ${JSON.stringify(c)}\n\n`;
+    for (const [res, m] of sse) if (!m || m.role === "edit") res.write(frame);
+    for (const [ws, m] of eventSockets) if ((!m || m.role === "edit") && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ harness: c }));
+  });
+  if (cfg.managedRoot) hermesSync.start();
+
+  const requireBoard = async (id: unknown): Promise<string> => {
+    if (typeof id !== "string" || !BOARD_ID_RE.test(id) || !(await relay.exists(id))) throw new HttpError(404, `no board ${String(id)}`);
+    return id;
+  };
+
+  const bundlesOf = async (boardId: string) => resolveGraph(await relay.graph(boardId));
+  /** Whose McBot this is, as people who join see it. */
+  const hostName = async () => (await setup.get()).profile?.name?.trim() || "A teammate";
+  /** The agents a guest (Can chat) may talk to: the ones their link named, on their board. */
+  const guestAgents = async (m: Member): Promise<GuestView["agents"]> => {
+    if (!m.boardId || !(await relay.list()).some((b) => b.id === m.boardId)) return [];
+    const { bundles } = await bundlesOf(m.boardId);
+    const pick = m.agents?.length ? new Set(m.agents) : null;
+    return bundles.filter((b) => !pick || pick.has(b.agent.id))
+      .map((b) => ({ id: b.agent.id, name: b.agent.data.name, displayName: b.agent.data.displayName || b.agent.data.name, description: b.agent.data.description ?? "" }));
+  };
+  /** Did this guest start that run? */
+  const ownsRun = async (m: Member, runId: string) =>
+    runBy.get(runId) === m.id || (await store.events(runId)).some((e) => e.type === "run.started" && e.by === m.id);
+  const modelsOf = (bundles: AgentBundle[]): ModelNode[] => [...new Map(bundles.flatMap((b) => b.models).map((m) => [m.id, m])).values()];
+
+  /** This board's compiled agents: profile name → node id (who can be given a task). */
+  const teamOf = async (boardId: string): Promise<Map<string, string>> => {
+    const [{ bundles }, manifest] = await Promise.all([bundlesOf(boardId), readManifest(cfg.hermesHome)]);
+    return new Map(bundles.filter((b) => manifest?.profiles.includes(b.agent.data.name)).map((b) => [b.agent.data.name, b.agent.id]));
+  };
+  /** `hermes kanban …` on this root's board; a failure becomes Hermes' own words, as a 409. */
+  const kanban = async (argv: string[], stdin = ""): Promise<string> => {
+    const found = await findHermes();
+    if (!found) throw new HttpError(503, "The engine is not set up yet");
+    const r = await runKanban(await prepareHermes(found, cfg.hermesHome), cfg.hermesHome, argv, stdin);
+    if (r.code !== 0) throw new HttpError(409, kanbanError(r));
+    return r.stdout;
+  };
+  /** Run `hermes <argv>` under the root; a failure becomes Hermes' own words, as a 409. */
+  const hermesCli = kanban;
+  /** An agent's conversations written as a dataset in <workspace>/datasets (Training's Export and Train). */
+  const dataset = async (boardIdIn: unknown, agentNodeId: string, format: DatasetFormat, pick: DatasetPick) => {
+    const boardId = await requireBoard(boardIdIn);
+    const graph = await relay.graph(boardId);
+    const { bundles } = resolveGraph(graph);
+    const bundle = bundles.find((b) => b.agent.id === agentNodeId);
+    if (!bundle) throw new HttpError(404, "No such agent on this board");
+    const [runs, rated, saved] = await Promise.all([store.list(boardId), ratings.all(), secrets.env()]);
+    const convs = await agentConversations(bundle, runs, rated, (id) => store.events(id));
+    const system = renderSoul(bundle.agent.data, bundle.team.map((t) => t.data), graph.brief);
+    const model = bundle.models[0]?.data.model ?? null;
+    const written = await writeDataset(join(cfg.workspace, "datasets"), { profile: bundle.agent.data.name, convs, format, pick, system, model, secrets: Object.values(saved) });
+    return { graph: { ...graph, id: boardId }, bundle, written };
+  };
+  const trainStore = new TrainStore(join(cfg.workspace, "training.json"));
+  /** When each running training job was last asked about. */
+  const trainAsked = new Map<string, number>();
+  /** A ready task starts only while the gateway runs (its dispatcher hands it to the agent). */
+  const wakeDispatcher = () => void runner.ensureGateway().then((r) => console.log(`[engine] tasks: gateway ${r}`)).catch(() => undefined);
+  const person = z.string().trim().min(1).max(64);
+
+  /**
+   * After a compile, a saved key and at start: fill every compiled agent's .env from the board
+   * compiled into this root, and keep the gateway up while any agent has a chat app whose bot
+   * token is saved (a bot must answer without a run in progress). Serialized; never throws.
+   */
+  let syncing: Promise<void> = Promise.resolve();
+  const syncAgents = (): Promise<void> => (syncing = syncing.then(async () => {
+    const manifest = await readManifest(cfg.hermesHome);
+    if (!manifest || !BOARD_ID_RE.test(manifest.graphId) || !(await relay.exists(manifest.graphId))) return;
+    const { bundles } = await bundlesOf(manifest.graphId);
+    const saved = await secrets.env();
+    let live = false;
+    for (const b of bundles) {
+      if (!manifest.profiles.includes(b.agent.data.name)) continue;
+      await writeProfileKeys(join(cfg.hermesHome, "profiles", b.agent.data.name), { ...resolveEntries(envEntriesFor(b), saved), ...(gateway ? apiEnv(gateway) : {}) });
+      live ||= hasLiveChannel(b, saved);
+      // A schedule fires only while a gateway serves its agent (cron/jobs.py, per-profile stores).
+      live ||= (await readSchedules(cfg.hermesHome, b.agent.data.name)).some((j) => j.enabled);
+    }
+    if (live) console.log(`[engine] chat apps and schedules: gateway ${await runner.ensureGateway()}`);
+  }).catch((err: unknown) => console.error("[engine] could not update agents' keys:", err)));
+  onBoardSaved = (boardId) => {
+    void readManifest(cfg.hermesHome).then((m) => { if (m?.graphId === boardId) void syncAgents(); }).catch(() => undefined);
+  };
+
+  const routes: Record<string, (req: IncomingMessage, url: URL) => Promise<unknown>> = {
+    "GET /api/health": async (): Promise<Health> => {
+      const bin = await findHermes();
+      return { ok: true, version: ENGINE_VERSION, workspace: cfg.workspace, hermesHome: cfg.hermesHome, managedRoot: cfg.managedRoot, hermes: { found: !!bin, path: bin?.path ?? null, kind: bin?.kind ?? null } };
+    },
+
+    // Is a newer McBot out? Asked of GitHub at most every 6 h; tests and dev never ask.
+    "GET /api/update": async (): Promise<UpdateView> => (cfg.checkUpdates ? updates.get() : { current: ENGINE_VERSION, latest: null, url: null, available: false }),
+    "GET /api/boards": async (): Promise<BoardInfo[]> => relay.list(),
+    /** Save a board as a file in <workspace>/exports/ (never overwriting an earlier one). */
+    "POST /api/boards/export": async (req): Promise<BoardExport> => {
+      const body = parse(z.object({ boardId: z.string() }), await json(req));
+      const graph = await relay.graph(await requireBoard(body.boardId));
+      return { ...(await writeExport(join(cfg.workspace, "exports"), graph)), graph };
+    },
+    /** A board file becomes a new board; nothing existing is replaced. Loaded loosely, like any board. */
+    "POST /api/boards/import": async (req): Promise<BoardInfo> => {
+      const body = parse(z.object({ graph: z.unknown(), fallbackName: z.string().max(80).optional() }), await json(req));
+      const graph = LooseGraph.safeParse(body.graph);
+      if (!graph.success) throw new HttpError(400, "This file isn't a McBot board.");
+      const name = (graph.data.name.trim() || body.fallbackName?.trim() || "Imported board").slice(0, 80);
+      const id = `${slugOf(name)}-${randomBytes(2).toString("hex")}`;
+      await relay.create(id, name, graph.data as Graph);
+      return { id, name };
+    },
+    /**
+     * Open a Hermes setup (default: this computer's ~/.hermes) as a new board: its agents, models,
+     * abilities, skills, tools, makers and bots, drawn. What the board cannot show yet comes back in
+     * `unshown`. Host only (it reads this computer's files), never a network member.
+     */
+    "POST /api/boards/from-hermes": async (req): Promise<BoardInfo & { unshown: Unshown[] }> => {
+      const body = parse(z.object({ path: z.string().trim().max(4096).optional() }), await json(req));
+      const root = resolve(body.path ? body.path.replace(/^~(?=$|[\\/])/, homedir()) : process.env.HERMES_HOME || join(homedir(), ".hermes"));
+      if (root === resolve(cfg.hermesHome)) throw new HttpError(409, "These are McBot's own agents; they are already on your boards.");
+      if (!(await isHermesHome(root))) throw new HttpError(404, `No Hermes setup in ${root}`);
+      const name = "My Hermes";
+      const id = `${slugOf(name)}-${randomBytes(2).toString("hex")}`;
+      const { graph, unshown } = await readSetup(root, { id, name });
+      const note = unshownNote(unshown, Date.now());
+      await relay.create(id, name, note ? { ...graph, notes: [note] } : graph);
+      return { id, name, unshown };
+    },
+    /** "Report a problem": version, system, engine state and the log's last lines, keys hidden. */
+    "GET /api/diagnostics": async (): Promise<Diagnostics> => {
+      const [hermes, boards, saved, log] = await Promise.all([hermesInfo(), relay.list(), secrets.env(), cfg.logFile ? tail(cfg.logFile) : Promise.resolve(null)]);
+      const text = diagnosticsText({ version: ENGINE_VERSION, os: osLine(), installed: hermes.installed, hermes, boards: boards.length, log, at: new Date() });
+      return { text: redact(text, Object.values(saved)) };
+    },
+
+    // ---- the Hermes runtime ----
+    "GET /api/hermes": async (): Promise<HermesInfo> => hermesInfo(),
+    /** Prepare McBot's own Hermes (first launch): tools and dependencies, minutes, progress in GET /api/hermes. */
+    "POST /api/hermes/prepare": async (): Promise<HermesInfo> => {
+      const src = bundledSource();
+      if (!src) throw new HttpError(404, "This McBot has no engine of its own");
+      if (setupJob.state !== "running") {
+        setupJob = { state: "running", lines: [] };
+        const push = (line: string) => {
+          setupJob.lines.push(line);
+          if (setupJob.lines.length > 200) setupJob.lines.splice(0, setupJob.lines.length - 200);
+        };
+        void (async () => {
+          // A run that starts meanwhile waits for this preparation (engine/hermes.ts setupHome).
+          const ready = await setupHome(src, cfg.hermesHome, push);
+          setupJob.state = ready?.env?.PYTHONPATH ? "done" : "failed";
+          push(setupJob.state === "done" ? "The engine is ready" : "The engine could not be prepared");
+        })();
+      }
+      return hermesInfo();
+    },
+    /** Stop McBot's own gateway; the next run starts a fresh one (picks up new keys and MCP servers). */
+    "POST /api/hermes/gateway/restart": async (): Promise<HermesInfo> => {
+      const bin = await findHermes();
+      if (!cfg.managedRoot) throw new HttpError(409, "This engine home is not McBot's own; restart its gateway yourself");
+      if (bin) await stopGateway(bin, cfg.hermesHome);
+      return hermesInfo();
+    },
+
+    // ---- setup assistant ----
+    "GET /api/setup": async (): Promise<SetupState> => setup.get(),
+    "GET /api/setup/detect": async (): Promise<SetupDetect> => {
+      const [bin, local, names] = await Promise.all([findHermes(), detectLocal(), secrets.names()]);
+      return { hermes: { found: !!bin, path: bin?.path ?? null, kind: bin?.kind ?? null, source: !!bundledSource() }, local, secrets: names };
+    },
+    // Ask McBot: the board's own model proposes a harness (engine/builder.ts). 409 when the board
+    // has no model it can ask; the app then makes the plan itself.
+    "POST /api/builder/plan": async (req): Promise<{ plan: HarnessPlan; by: string }> => {
+      const body = parse(z.object({ boardId: z.string(), request: z.string().trim().min(3).max(2000), choices: PlanChoicesSchema }), await json(req));
+      const model = plannerModel(await relay.graph(await requireBoard(body.boardId)));
+      if (!model) throw new HttpError(409, "No model on this board to ask");
+      const key = model.data.apiKeyEnv ? (await secrets.env())[model.data.apiKeyEnv] : undefined;
+      try {
+        return { plan: await askForPlan(model, key, body.request, body.choices), by: model.data.label || model.data.name };
+      } catch (err) {
+        throw new HttpError(409, err instanceof Error ? err.message : String(err));
+      }
+    },
+    "POST /api/setup/models": async (req) => {
+      const body = parse(z.object({ baseUrl: z.string().url(), keyName: z.string().optional() }), await json(req));
+      const key = body.keyName ? (await secrets.env())[body.keyName] : undefined;
+      return { models: await listModels(body.baseUrl, key, 4000) };
+    },
+    /** The board the assistant built: fills the empty first-run board, else a new one. */
+    "POST /api/setup/board": async (req): Promise<BoardInfo> => {
+      const body = parse(z.object({ name: z.string().trim().min(1).max(80), graph: LooseGraph }), await json(req));
+      const boards = await relay.list();
+      const graph = { ...body.graph, name: body.name } as Graph;
+      if (boards.length === 1 && (await relay.fillIfEmpty(boards[0]!.id, graph))) return { id: boards[0]!.id, name: body.name };
+      const id = `${slugOf(body.name)}-${randomBytes(2).toString("hex")}`;
+      await relay.create(id, body.name, graph);
+      return { id, name: body.name };
+    },
+    "POST /api/setup/complete": async (req): Promise<SetupState> => {
+      const profile = z.object({
+        kind: z.enum(["personal", "team", "company"]), name: z.string().max(80), company: z.string().max(120), about: z.string().max(600), role: z.string().max(120),
+      }).nullable();
+      const body = parse(z.object({ profile }), await json(req));
+      return setup.complete(body.profile);
+    },
+    "GET /api/secrets": async () => ({ names: await secrets.names() }),
+    "POST /api/secrets": async (req) => {
+      const body = parse(z.object({ name: z.string(), value: z.string() }), await json(req));
+      try {
+        await secrets.set(body.name, body.value);
+      } catch (err) {
+        if (err instanceof SecretError) throw new HttpError(400, err.message);
+        throw err;
+      }
+      // A running gateway was started without this key.
+      if (cfg.managedRoot) runner.markGatewayStale();
+      void syncAgents();
+      return { names: await secrets.names() };
+    },
+    /** Forget a saved key (Settings). Agents that name it run without it after the next sync. */
+    "POST /api/secrets/remove": async (req) => {
+      const { name } = parse(z.object({ name: z.string() }), await json(req));
+      await secrets.remove(name);
+      if (cfg.managedRoot) runner.markGatewayStale();
+      void syncAgents();
+      return { names: await secrets.names() };
+    },
+    "POST /api/boards": async (req) => {
+      const { name } = parse(z.object({ name: z.string().trim().min(1).max(80) }), await json(req));
+      const id = `${slugOf(name)}-${randomBytes(2).toString("hex")}`;
+      await relay.create(id, name);
+      return { id, name };
+    },
+
+    "GET /api/compile": async (_req, url): Promise<CompileResponse> => compileBoard(await requireBoard(url.searchParams.get("boardId")), true),
+    "POST /api/compile": async (req): Promise<CompileResponse> => {
+      const body = parse(z.object({ boardId: z.string(), dryRun: z.boolean().default(false) }), await json(req));
+      return compileBoard(await requireBoard(body.boardId), body.dryRun);
+    },
+
+    "GET /api/versions": async (_req, url) => ({ versions: await readVersions(await requireBoard(url.searchParams.get("boardId"))) }),
+    "POST /api/versions/name": async (req) => {
+      const body = parse(z.object({ boardId: z.string(), id: z.string(), name: z.string().trim().max(80) }), await json(req));
+      const boardId = await requireBoard(body.boardId);
+      const versions = await readVersions(boardId);
+      const v = versions.find((x) => x.id === body.id);
+      if (!v) throw new HttpError(404, "no such version");
+      v.name = body.name || null;
+      await writeVersions(boardId, versions);
+      return { versions };
+    },
+    "GET /api/runs": async (req, url) => {
+      const list = await store.list(url.searchParams.get("boardId") ?? undefined);
+      const m = memberOf.get(req);
+      return m?.role === "chat" ? list.filter((r) => r.by === m.id) : list;
+    },
+    "POST /api/runs": async (req) => {
+      const body = parse(z.object({ boardId: z.string(), agentNodeId: z.string(), prompt: z.string().trim().min(1).max(100_000) }), await json(req));
+      const who = memberOf.get(req) ?? null;
+      if (who?.role === "chat") {
+        // A guest: only the agents their link named, one question at a time.
+        if (body.boardId !== who.boardId || !(await guestAgents(who)).some((a) => a.id === body.agentNodeId)) throw new HttpError(403, "You can't chat with that agent");
+        if ((await store.list(who.boardId)).some((r) => r.by === who.id && r.status === "running")) throw new HttpError(409, "Wait for the answer, then ask again.");
+      }
+      const boardId = await requireBoard(body.boardId);
+      const { bundles, issues } = await bundlesOf(boardId);
+      const bundle = bundles.find((b) => b.agent.id === body.agentNodeId);
+      if (!bundle) throw new HttpError(404, "no such agent on this board");
+      const agentName = bundle.agent.data.displayName || bundle.agent.data.name;
+      let drift = await compileBoard(boardId, true);
+      if (!drift.ok) throw new HttpError(409, who?.role === "chat" ? `${agentName} isn't ready right now. Ask ${await hostName()} to check it.` : "The board has errors; fix them before running.", who?.role === "chat" ? {} : { issues });
+      const dir = `profiles/${bundle.agent.data.name}/`;
+      let stale = drift.report.changes.filter((c) => c.path.startsWith(dir) && c.status !== "unchanged");
+      // A guest can't compile: their question uses the board as it is now, as the host's would.
+      if (stale.length && who?.role === "chat") {
+        const done = await compileBoard(boardId, false);
+        if (!done.ok) throw new HttpError(409, `${agentName} isn't ready right now. Ask ${await hostName()} to check it.`);
+        drift = await compileBoard(boardId, true);
+        stale = drift.ok ? drift.report.changes.filter((c) => c.path.startsWith(dir) && c.status !== "unchanged") : stale;
+      }
+      if (stale.length) throw new HttpError(409, `The board changed since ${bundle.agent.data.name} was last compiled. Compile, then run.`, { stale: stale.map((c) => c.path) });
+      if (!(await findHermes())) throw new HttpError(503, "The engine is not set up yet");
+      // A daily budget stops the runs McBot starts once today's (UTC) spend reaches it.
+      const limit = bundle.agent.data.dailyBudgetUsd ?? 0;
+      if (limit > 0) {
+        const name = bundle.agent.data.name;
+        const [b] = buildCostReport([{ profile: name, agentNodeId: bundle.agent.id, sessions: readSessions(cfg.hermesHome, name), dailyBudgetUsd: limit }], [], bundle.models).budgets;
+        if (b?.state === "over") throw new HttpError(409, `${bundle.agent.data.displayName || name} reached today's budget ($${b.spentTodayUsd.toFixed(2)} of $${limit.toFixed(2)}). Raise it to keep going.`, { budget: b });
+      }
+      // What is true right now about this agent's tasks, which run in sessions of their own
+      // (src/harness/liveContext.ts). A guest's run carries none of the board's work.
+      let instructions: string | undefined;
+      if (who?.role !== "chat") {
+        const profile = bundle.agent.data.name;
+        const tasks = readTasks(cfg.hermesHome, await teamOf(boardId), boardId);
+        const saved = Object.values(await secrets.env());
+        const work = new Map(tasks.filter((t) => t.assignee === profile && t.status === "running")
+          .map((t) => [t.id, readTaskWork(cfg.hermesHome, profile, t.id, (x) => redact(x, saved))] as const)
+          .filter((e): e is readonly [string, NonNullable<typeof e[1]>] => !!e[1]));
+        const names = new Map(bundles.map((b) => [b.agent.data.name, b.agent.data.displayName || b.agent.data.name]));
+        instructions = liveContext({ profile, tasks, work, nameOf: (w) => names.get(w) ?? w, now: Date.now() }) ?? undefined;
+      }
+      const runId = await runner.start({
+        boardId, agentNodeId: bundle.agent.id, profile: bundle.agent.data.name, prompt: body.prompt, ...(instructions ? { instructions } : {}),
+        toolNodes: bundle.tools.map((t) => ({ id: t.id, name: t.data.name })), models: bundle.models,
+        env: envEntriesFor(bundle),
+        ...(who ? { by: { id: who.id, name: who.name } } : {}),
+      });
+      return { runId };
+    },
+
+    // ---- skills and connectors: Hermes' own library, per agent (this computer only) ----
+    "GET /api/skills": async (_req, url) => {
+      const src = bundledSource();
+      const profile = url.searchParams.get("profile");
+      const dir = profile && PROFILE_RE.test(profile) ? join(cfg.hermesHome, "profiles", profile) : null;
+      return {
+        library: src ? listLibrary(src.dir) : [],
+        installed: dir ? installedSkills(dir) : [],
+        seeded: dir ? bundledSeeded(dir) : false,
+        compiled: dir ? existsSync(dir) : false,
+        skills: dir ? profileSkills(dir) : [],
+      };
+    },
+    // ---- knowledge: documents for the agents, and the whole knowledge as Markdown ----
+    "POST /api/knowledge/doc": async (req, url) => {
+      // The original's bytes as the body, its name in the query: kept in files/knowledge/, read to text here.
+      const name = safeDocName(url.searchParams.get("name") ?? "");
+      const kind = docKind(name);
+      if (!kind) throw new HttpError(415, "McBot reads text, PDF and Office files (Word, Excel, PowerPoint, OpenDocument, RTF, EPUB)");
+      const data = await rawBody(req, DOC_MAX_BYTES);
+      if (!data.length) throw new HttpError(400, "The file is empty");
+      const path = await saveDoc(join(cfg.workspace, "files", "knowledge"), name, data);
+      let raw: string;
+      if (kind === "text") raw = data.toString("utf8");
+      else {
+        const found = await findHermes();
+        if (!found || found.kind !== "bundled" || !found.prefix?.[0]) throw new HttpError(409, "PDF and Office files are read by McBot's own engine; add a text version instead");
+        const prepared = await prepareHermes(found, cfg.hermesHome);
+        const cmd = hermesCommand(prepared, [], hermesEnv(cfg.hermesHome));
+        try {
+          raw = await extractWithHermes(prepared.path, hermesDirOf(prepared.prefix![0]!), cmd.env, path);
+        } catch (err) {
+          throw new HttpError(422, `McBot couldn't read ${name}: ${(err as Error).message}`);
+        }
+      }
+      const { text, truncated } = docText(raw);
+      return { name: basename(path), text, bytes: data.length, truncated, file: relative(join(cfg.workspace, "files"), path).replace(/\\/g, "/") };
+    },
+    "POST /api/knowledge/export": async (req) => {
+      // Never over an earlier file, like board exports.
+      const body = parse(z.object({ boardId: z.string(), markdown: z.string().min(1).max(5_000_000) }), await json(req));
+      const boardId = await requireBoard(body.boardId);
+      const dir = join(cfg.workspace, "exports");
+      await mkdir(dir, { recursive: true });
+      const stamp = new Date().toISOString().slice(0, 10);
+      const path = freePath(dir, `${boardId}-knowledge-${stamp}.md`);
+      await writeFile(path, body.markdown, { flag: "wx" });
+      return { path };
+    },
+    "POST /api/skills/install": async (req) => {
+      const body = parse(z.object({ profile: z.string().regex(PROFILE_RE), id: z.string().regex(SKILL_ID_RE) }), await json(req));
+      if (!existsSync(join(cfg.hermesHome, "profiles", body.profile))) throw new HttpError(409, `Compile ${body.profile} first`);
+      await hermesCli(["-p", body.profile, ...installArgv(body.id)]);
+      if (cfg.managedRoot) runner.markGatewayStale();
+      return { installed: installedSkills(join(cfg.hermesHome, "profiles", body.profile)) };
+    },
+    "POST /api/skills/uninstall": async (req) => {
+      const body = parse(z.object({ profile: z.string().regex(PROFILE_RE), name: z.string().regex(SKILL_NAME_RE) }), await json(req));
+      const dir = join(cfg.hermesHome, "profiles", body.profile);
+      if (!existsSync(dir)) throw new HttpError(409, `Compile ${body.profile} first`);
+      await hermesCli(["-p", body.profile, ...uninstallArgv(body.name)]);
+      if (cfg.managedRoot) runner.markGatewayStale();
+      return { installed: installedSkills(dir), skills: profileSkills(dir) };
+    },
+    "POST /api/skills/update": async (req) => {
+      const body = parse(z.object({ profile: z.string().regex(PROFILE_RE), name: z.string().regex(SKILL_NAME_RE) }), await json(req));
+      const dir = join(cfg.hermesHome, "profiles", body.profile);
+      if (!existsSync(dir)) throw new HttpError(409, `Compile ${body.profile} first`);
+      await hermesCli(["-p", body.profile, ...updateArgv(body.name)]);
+      if (cfg.managedRoot) runner.markGatewayStale();
+      return { installed: installedSkills(dir), skills: profileSkills(dir) };
+    },
+    // Skills from anywhere: Hermes searches its registries (skills.sh, GitHub, ClawHub…), and a
+    // pasted GitHub link or SKILL.md URL installs after Hermes' own security scan.
+    "GET /api/skills/search": async (_req, url) => {
+      const q = (url.searchParams.get("q") ?? "").trim().slice(0, 100);
+      if (!q) return { results: [] };
+      return { results: parseSkillSearch(await hermesCli(searchSkillsArgv(q))) };
+    },
+    "POST /api/skills/add": async (req) => {
+      const body = parse(z.object({ profile: z.string().regex(PROFILE_RE), source: z.string().trim().min(3).max(500) }), await json(req));
+      const dir = join(cfg.hermesHome, "profiles", body.profile);
+      if (!existsSync(dir)) throw new HttpError(409, `Compile ${body.profile} first`);
+      const sources = skillSources(body.source);
+      if (!sources) throw new HttpError(400, "Paste a GitHub link, a link to a SKILL.md, or a skill's identifier");
+      const found = await findHermes();
+      if (!found) throw new HttpError(503, "The engine is not set up yet");
+      const bin = await prepareHermes(found, cfg.hermesHome);
+      let last = "";
+      for (const src of sources) {
+        const r = await runKanban(bin, cfg.hermesHome, ["-p", body.profile, ...addSkillArgv(src)], "", 3 * 60_000);
+        if (r.code === 0) {
+          if (cfg.managedRoot) runner.markGatewayStale();
+          return { installed: installedSkills(dir), skills: profileSkills(dir), from: src };
+        }
+        last = kanbanError(r);
+      }
+      throw new HttpError(409, last || "Hermes could not install that skill");
+    },
+
+    // ---- plugins: Hermes' curated catalog, and each agent's own (this computer only) ----
+    "GET /api/plugins/catalog": async () => {
+      const src = bundledSource();
+      // The long description stays in the engine; cards show the first sentence.
+      return { plugins: src ? listPluginCatalog(src.dir).map((p) => ({ ...p, description: "" })) : [] };
+    },
+    "GET /api/plugins": async (_req, url) => {
+      const profile = url.searchParams.get("profile") ?? "";
+      if (!PROFILE_RE.test(profile)) throw new HttpError(400, "profile?");
+      const dir = join(cfg.hermesHome, "profiles", profile);
+      if (!existsSync(dir)) return { compiled: false, installed: [] };
+      return { compiled: true, installed: parsePluginList(await hermesCli(["-p", profile, ...listPluginsArgv])) };
+    },
+    "POST /api/plugins/act": async (req) => {
+      const body = parse(z.object({ profile: z.string().regex(PROFILE_RE), name: z.string().regex(PLUGIN_NAME_RE), act: z.enum(["install", "enable", "disable", "remove"]) }), await json(req));
+      if (!existsSync(join(cfg.hermesHome, "profiles", body.profile))) throw new HttpError(409, `Compile ${body.profile} first`);
+      const argv = { install: installPluginArgv, enable: enablePluginArgv, disable: disablePluginArgv, remove: removePluginArgv }[body.act](body.name);
+      const found = await findHermes();
+      if (!found) throw new HttpError(503, "The engine is not set up yet");
+      // An install clones the pinned commit and scans it: minutes on a slow line.
+      const r = await runKanban(await prepareHermes(found, cfg.hermesHome), cfg.hermesHome, ["-p", body.profile, ...argv], "", body.act === "install" ? 5 * 60_000 : 60_000);
+      if (r.code !== 0) throw new HttpError(409, kanbanError(r));
+      // Plugins load when the gateway starts.
+      if (cfg.managedRoot) runner.markGatewayStale();
+      return { compiled: true, installed: parsePluginList(await hermesCli(["-p", body.profile, ...listPluginsArgv])) };
+    },
+    // How the last sign-in for each agent's connector went (POST starts one; the Inspector asks).
+    "GET /api/connectors/login": async (_req, url): Promise<SignInView> => {
+      const key = `${url.searchParams.get("profile") ?? ""}/${url.searchParams.get("name") ?? ""}`;
+      return signIns.get(key) ?? { state: "none", error: null, at: null };
+    },
+    "POST /api/connectors/login": async (req) => {
+      // Hermes opens the system browser and waits for the sign-in to come back (mcp_config.py
+      // cmd_mcp_login); the tokens it saves are read when the gateway next starts its MCP servers.
+      const body = parse(z.object({ profile: z.string().regex(PROFILE_RE), name: z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/) }), await json(req));
+      if (!existsSync(join(cfg.hermesHome, "profiles", body.profile))) throw new HttpError(409, `Compile ${body.profile} first`);
+      const found = await findHermes();
+      if (!found) throw new HttpError(503, "The engine is not set up yet");
+      const bin = await prepareHermes(found, cfg.hermesHome);
+      const key = `${body.profile}/${body.name}`;
+      signIns.set(key, { state: "waiting", error: null, at: Date.now() });
+      void runKanban(bin, cfg.hermesHome, ["-p", body.profile, "mcp", "login", body.name, "--flow", "browser"], "", 10 * 60_000).then((r) => {
+        console.log(`[engine] ${body.profile}: sign-in to ${body.name} ${r.code === 0 ? "done" : `failed: ${kanbanError(r)}`}`);
+        signIns.set(key, r.code === 0 ? { state: "done", error: null, at: Date.now() } : { state: "failed", error: kanbanError(r), at: Date.now() });
+        if (r.code === 0 && cfg.managedRoot) runner.markGatewayStale();
+      }, (err: unknown) => signIns.set(key, { state: "failed", error: err instanceof Error ? err.message : String(err), at: Date.now() }));
+      return { started: true };
+    },
+
+    // ---- share on your network (this computer only: members never reach these) ----
+    "GET /api/share": async (): Promise<SharingView> => shareView(),
+    "POST /api/share": async (req): Promise<SharingView> => {
+      const { on, reach } = parse(z.object({ on: z.boolean(), reach: z.enum(["network", "internet"]).optional() }), await json(req));
+      if (reach) await sharing.setReach(reach, (await sharing.reach()).ownUrl);
+      await sharing.setOn(on);
+      await applySharing();
+      return shareView();
+    },
+    /** Who links reach: this network, or anyone (the quick tunnel, or the host's own address). */
+    "POST /api/share/reach": async (req): Promise<SharingView> => {
+      const body = parse(z.object({ reach: z.enum(["network", "internet"]), ownUrl: z.string().max(300).nullable().optional() }), await json(req));
+      const own = body.ownUrl ? cleanOwnUrl(body.ownUrl) : null;
+      if (body.ownUrl && !own) throw new HttpError(400, "Use a web address like https://team.example.com");
+      await sharing.setReach(body.reach, body.ownUrl === undefined ? (await sharing.reach()).ownUrl : own);
+      await applySharing();
+      return shareView();
+    },
+    /** A new link: for teammates (Can edit), or for guests to chat with some agents of a board. */
+    "POST /api/share/invite": async (req): Promise<SharingView> => {
+      const body = parse(z.object({
+        role: z.enum(["edit", "chat"]).default("edit"), boardId: z.string().optional(),
+        agents: z.array(z.string().max(80)).max(50).optional(), fresh: z.boolean().default(true),
+      }), await json(req));
+      if (body.role === "chat") {
+        const boardId = await requireBoard(body.boardId);
+        const { bundles } = await bundlesOf(boardId);
+        if (!bundles.length) throw new HttpError(409, "Add an agent to this board first");
+        const ids = new Set(bundles.map((b) => b.agent.id));
+        if (body.agents?.some((a) => !ids.has(a))) throw new HttpError(400, "No such agent on this board");
+        await sharing.invite({ role: "chat", boardId, agents: body.agents ?? [] }, body.fresh);
+      } else {
+        await sharing.invite({ role: "edit" }, body.fresh);
+      }
+      return shareView();
+    },
+    "POST /api/share/remove": async (req): Promise<SharingView> => {
+      const { id } = parse(z.object({ id: z.string() }), await json(req));
+      await sharing.remove(id);
+      return shareView();
+    },
+    // ---- passwords: the person's logins for the browser (this computer's own window only) ----
+    "GET /api/logins": async (_req, url) => loginCall(async () => ({ logins: await logins.list(url.searchParams.get("host") ?? undefined) })),
+    "POST /api/logins": async (req) => {
+      const body = parse(z.object({ id: z.string().max(80).optional(), url: z.string().max(500), username: z.string().max(200).default(""), password: z.string().max(1000).optional(), note: z.string().max(500).optional() }), await json(req));
+      return loginCall(async () => ({ login: await logins.put(body), logins: await logins.list() }));
+    },
+    "POST /api/logins/remove": async (req) => {
+      const { id } = parse(z.object({ id: z.string().max(80) }), await json(req));
+      return loginCall(async () => { await logins.remove(id); return { logins: await logins.list() }; });
+    },
+    /** A password itself, for copy or fill in this window; never listed, never to someone who joined. */
+    "POST /api/logins/reveal": async (req) => {
+      const { id } = parse(z.object({ id: z.string().max(80) }), await json(req));
+      return loginCall(() => logins.reveal(id));
+    },
+    // ---- add from GitHub: what a repository is, and putting it to use (this computer only) ----
+    "GET /api/github/inspect": async (_req, url) => {
+      const ref = parseGitHub(url.searchParams.get("url") ?? "");
+      if (!ref) throw new HttpError(400, "Paste a GitHub link, like github.com/owner/repo");
+      return githubCall(async () => inspectRepo(ref, await githubToken()));
+    },
+    /** A Hermes plugin from GitHub: `hermes -p <agent> plugins install owner/repo[/path]` (plugins_cmd.py _resolve_git_url). */
+    "POST /api/github/plugin": async (req) => {
+      const body = parse(z.object({ profile: z.string().regex(PROFILE_RE), source: z.string().regex(GITHUB_SOURCE_RE) }), await json(req));
+      if (!existsSync(join(cfg.hermesHome, "profiles", body.profile))) throw new HttpError(409, `Compile ${body.profile} first`);
+      const found = await findHermes();
+      if (!found) throw new HttpError(503, "The engine is not set up yet");
+      const r = await runKanban(await prepareHermes(found, cfg.hermesHome), cfg.hermesHome, ["-p", body.profile, ...installPluginArgv(body.source)], "", 5 * 60_000);
+      if (r.code !== 0) throw new HttpError(409, kanbanError(r));
+      if (cfg.managedRoot) runner.markGatewayStale();
+      return { installed: body.source };
+    },
+    /** A project from GitHub, unpacked into the shared files folder (`files/github/<repo>`) for agents. */
+    "POST /api/github/download": async (req) => {
+      const { url } = parse(z.object({ url: z.string().max(500) }), await json(req));
+      const ref = parseGitHub(url);
+      if (!ref) throw new HttpError(400, "Paste a GitHub link, like github.com/owner/repo");
+      const dest = await githubCall(async () => downloadRepo(ref, join(cfg.workspace, "files", "github"), await githubToken()));
+      return { folder: `github/${ref.repo}`, path: dest };
+    },
+    /** Someone who joined: whose McBot this is, and (a guest) the agents they may chat with. */
+    "GET /api/guest": async (req): Promise<GuestView> => {
+      const m = memberOf.get(req) ?? null;
+      const host = await hostName();
+      if (!m || m.role === "edit") return { host, role: "edit", name: m?.name ?? host, boardId: null, agents: [] };
+      return { host, role: "chat", name: m.name, boardId: m.boardId ?? null, agents: await guestAgents(m) };
+    },
+
+    // ---- tasks: Hermes' kanban, shared by the agents compiled into this root ----
+    "GET /api/tasks": async (_req, url): Promise<TasksView> => {
+      const team = await teamOf(await requireBoard(url.searchParams.get("boardId")));
+      const boardId = await requireBoard(url.searchParams.get("boardId"));
+      return { tasks: readTasks(cfg.hermesHome, team, boardId), gateway: (await gatewayStatus(cfg.hermesHome)).running };
+    },
+    "GET /api/tasks/one": async (req, url): Promise<TaskDetail> => {
+      const team = await teamOf(await requireBoard(url.searchParams.get("boardId")));
+      const task = readTask(cfg.hermesHome, url.searchParams.get("id") ?? "", team);
+      if (!task) throw new HttpError(404, "no such task");
+      // What its agent has done so far, from its Hermes session: this computer's windows only.
+      const profile = task.attempts.at(-1)?.profile ?? task.assignee;
+      if (memberOf.get(req) || !profile || !task.attempts.length) return task;
+      const saved = Object.values(await secrets.env());
+      return { ...task, work: readTaskWork(cfg.hermesHome, profile, task.id, (t) => redact(t, saved)) };
+    },
+    "POST /api/tasks": async (req): Promise<TaskView> => {
+      const body = parse(z.object({
+        boardId: z.string(), title: z.string().trim().min(1).max(300), body: z.string().max(20_000).default(""),
+        assignee: z.string().nullable().default(null), parents: z.array(z.string().regex(TASK_ID_RE)).max(20).default([]), by: person,
+        // Keep working until a check agrees it is done (Hermes' goal mode).
+        goal: z.boolean().default(false),
+      }), await json(req));
+      const team = await teamOf(await requireBoard(body.boardId));
+      if (body.assignee !== null && !team.has(body.assignee)) throw new HttpError(409, `${body.assignee} isn't a compiled agent on this board. Compile, then give it tasks.`);
+      const out = await kanban(createArgv({ title: body.title, body: body.body, assignee: body.assignee, createdBy: body.by, parents: body.parents, tenant: boardTenant(body.boardId), goal: body.goal }), body.body);
+      const id = (JSON.parse(out) as { id?: string }).id ?? "";
+      const task = readTask(cfg.hermesHome, id, team);
+      if (!task) throw new HttpError(500, "Hermes did not create the task");
+      if (task.assignee) wakeDispatcher();
+      return task;
+    },
+    "POST /api/tasks/act": async (req): Promise<TaskDetail> => {
+      const body = parse(z.object({ boardId: z.string(), id: z.string().regex(TASK_ID_RE), by: person }).and(z.discriminatedUnion("action", [
+        z.object({ action: z.literal("comment"), text: z.string().trim().min(1).max(20_000) }),
+        z.object({ action: z.literal("assign"), profile: z.string().nullable() }),
+        z.object({ action: z.literal("complete"), text: z.string().trim().max(20_000).optional() }),
+        z.object({ action: z.literal("block"), text: z.string().trim().max(20_000).optional() }),
+        z.object({ action: z.literal("unblock") }),
+        z.object({ action: z.literal("changes"), text: z.string().trim().min(1).max(20_000) }),
+        z.object({ action: z.literal("archive") }),
+      ])), await json(req));
+      const team = await teamOf(await requireBoard(body.boardId));
+      if (body.action === "assign" && body.profile !== null && !team.has(body.profile)) throw new HttpError(409, `${body.profile} isn't a compiled agent on this board`);
+      const before = readTask(cfg.hermesHome, body.id, team);
+      if (!before) throw new HttpError(404, "no such task");
+      // Hermes refuses a completion with no evidence, except a review's approval (kanban_db.py
+      // `_gate_empty_completion`): a person's "Mark done" keeps what came of it, else says who closed it.
+      const action = body.action === "complete" && !body.text && before.status !== "review"
+        ? { ...body, text: before.result ?? `Marked done by ${body.by}` } : body;
+      await kanban(actionArgv(body.id, action as TaskAction, body.by));
+      const task = readTask(cfg.hermesHome, body.id, team);
+      if (!task) throw new HttpError(404, "no such task");
+      if (task.assignee && ["ready", "todo"].includes(task.status)) wakeDispatcher();
+      return task;
+    },
+
+    // ---- schedules: each agent's Hermes cron jobs ----
+    "GET /api/schedules": async (_req, url): Promise<AgentSchedules[]> => {
+      const team = await teamOf(await requireBoard(url.searchParams.get("boardId")));
+      return Promise.all([...team].map(async ([profile, agentNodeId]) => ({ agentNodeId, profile, schedules: await readSchedules(cfg.hermesHome, profile) })));
+    },
+    "POST /api/schedules": async (req): Promise<AgentSchedules> => {
+      const body = parse(z.object({ boardId: z.string(), profile: z.string(), when: z.string().trim().min(1).max(100), prompt: z.string().trim().min(1).max(20_000), name: z.string().trim().max(80).default("") }), await json(req));
+      const team = await teamOf(await requireBoard(body.boardId));
+      const agentNodeId = team.get(body.profile);
+      if (!agentNodeId) throw new HttpError(409, `${body.profile} isn't a compiled agent on this board. Compile, then schedule it.`);
+      await hermesCli(createScheduleArgv(body.profile, body.when, body.prompt, body.name));
+      wakeDispatcher();
+      return { agentNodeId, profile: body.profile, schedules: await readSchedules(cfg.hermesHome, body.profile) };
+    },
+    "POST /api/schedules/act": async (req): Promise<AgentSchedules> => {
+      const body = parse(z.object({ boardId: z.string(), profile: z.string(), id: z.string().regex(JOB_ID_RE), action: z.enum(["pause", "resume", "run", "remove"]) }), await json(req));
+      const team = await teamOf(await requireBoard(body.boardId));
+      const agentNodeId = team.get(body.profile);
+      if (!agentNodeId) throw new HttpError(404, `no compiled agent ${body.profile}`);
+      await hermesCli(scheduleActionArgv(body.profile, body.id, body.action));
+      if (body.action === "resume" || body.action === "run") wakeDispatcher();
+      return { agentNodeId, profile: body.profile, schedules: await readSchedules(cfg.hermesHome, body.profile) };
+    },
+
+    "GET /api/memory": async (_req, url): Promise<AgentMemoryView[]> => {
+      const boardId = await requireBoard(url.searchParams.get("boardId"));
+      const { bundles } = await bundlesOf(boardId);
+      const manifest = await readManifest(cfg.hermesHome);
+      return Promise.all(bundles.map(async ({ agent }) => ({
+        profile: agent.data.name,
+        nodeId: agent.id,
+        displayName: agent.data.displayName || agent.data.name,
+        compiled: !!manifest?.profiles.includes(agent.data.name),
+        busy: runner.isBusy(agent.data.name),
+        memory: await readMemory(cfg.hermesHome, agent.data.name, "memory"),
+        user: await readMemory(cfg.hermesHome, agent.data.name, "user"),
+      })));
+    },
+    "PUT /api/memory": async (req) => {
+      const body = parse(z.object({
+        profile: z.string(), target: z.enum(["memory", "user"]), entries: z.array(z.string().max(5000)).max(500), baseSha256: z.string().nullable(),
+      }), await json(req));
+      const manifest = await readManifest(cfg.hermesHome);
+      if (!manifest?.profiles.includes(body.profile)) throw new HttpError(404, `profile ${body.profile} is not compiled by McBot`);
+      if (runner.isBusy(body.profile)) throw new HttpError(409, `${body.profile} is running; edit its memory when the run finishes`);
+      try {
+        return await writeMemory(cfg.hermesHome, body.profile, body.target, body.entries, body.baseSha256);
+      } catch (err) {
+        if (err instanceof MemoryConflict) throw new HttpError(409, err.message);
+        throw err;
+      }
+    },
+
+    "GET /api/cost": async (_req, url) => {
+      const boardId = await requireBoard(url.searchParams.get("boardId"));
+      const { bundles } = await bundlesOf(boardId);
+      const manifest = await readManifest(cfg.hermesHome);
+      const profiles = bundles
+        .filter((b) => manifest?.profiles.includes(b.agent.data.name))
+        .map((b) => ({ profile: b.agent.data.name, agentNodeId: b.agent.id, sessions: readSessions(cfg.hermesHome, b.agent.data.name), dailyBudgetUsd: b.agent.data.dailyBudgetUsd ?? null }));
+      return buildCostReport(profiles, await store.list(boardId), modelsOf(bundles));
+    },
+
+    // ---- learn from your work (engine/learn.ts, src/harness/learn.ts) ----
+    "GET /api/ratings": async (_req, url): Promise<Record<string, Rating>> => {
+      const boardId = await requireBoard(url.searchParams.get("boardId"));
+      const mine = new Set((await store.list(boardId)).map((r) => r.runId));
+      return Object.fromEntries(Object.entries(await ratings.all()).filter(([id]) => mine.has(id)));
+    },
+    "POST /api/ratings": async (req): Promise<{ runId: string; rating: Rating | null }> => {
+      const body = parse(z.object({ runId: z.string().regex(/^run_[a-z0-9]+_[a-f0-9]+$/), score: z.union([z.literal(0), z.literal(1), z.null()]), note: z.string().trim().max(500).optional() }), await json(req));
+      if (!(await store.events(body.runId)).length) throw new HttpError(404, "No such run");
+      const rating: Rating | null = body.score === null ? null : { score: body.score, at: Date.now(), ...(body.note ? { note: body.note } : {}) };
+      await ratings.set(body.runId, rating);
+      return { runId: body.runId, rating };
+    },
+    "GET /api/learn": async (_req, url): Promise<LearnView> => {
+      const boardId = await requireBoard(url.searchParams.get("boardId"));
+      const { bundles } = await bundlesOf(boardId);
+      const [runs, rated] = await Promise.all([store.list(boardId), ratings.all()]);
+      const agents: LearnView["agents"] = [];
+      for (const b of bundles) agents.push(learnAgent(b, await agentConversations(b, runs, rated, (id) => store.events(id)), rated));
+      const dir = join(cfg.workspace, "datasets");
+      const home = homedir();
+      return { agents, folder: home.length > 1 && dir.startsWith(home) ? `~${dir.slice(home.length)}` : dir };
+    },
+    /** One agent's conversations as a training dataset in <workspace>/datasets/. Host only: it holds every chat. */
+    "POST /api/learn/export": async (req): Promise<LearnExport> => {
+      const body = parse(z.object({ boardId: z.string(), agentNodeId: z.string(), format: z.enum(["chat", "rewards", "sharegpt"]), pick: z.enum(["good", "all"]) }), await json(req));
+      return (await dataset(body.boardId, body.agentNodeId, body.format, body.pick)).written;
+    },
+
+    // ---- training in the cloud: the provider's OpenAI fine-tuning API (engine/train.ts) ----
+    "GET /api/train": async (_req, url): Promise<TrainJob[]> => {
+      const boardId = await requireBoard(url.searchParams.get("boardId"));
+      const jobs = (await trainStore.all()).filter((j) => j.boardId === boardId);
+      const saved = await secrets.env();
+      // Ask the provider about jobs still going, at most every 15 s each.
+      await Promise.all(jobs.filter((j) => isActive(j) && Date.now() - (trainAsked.get(j.id) ?? 0) > 15_000).map(async (j) => {
+        trainAsked.set(j.id, Date.now());
+        const key = saved[j.keyEnv];
+        if (!key) return;
+        try {
+          const now = await readFineTune(fetch, { baseUrl: j.baseUrl, key, remoteId: j.remoteId });
+          if (now.status !== j.status || now.model !== j.model) {
+            Object.assign(j, now, { updatedAt: Date.now() });
+            await trainStore.put(j);
+          }
+        } catch {
+          /* asked again on the next look */
+        }
+      }));
+      return jobs;
+    },
+    "POST /api/train": async (req): Promise<TrainJob> => {
+      const body = parse(z.object({ boardId: z.string(), agentNodeId: z.string(), modelNodeId: z.string(), baseModel: z.string().trim().min(1).max(200), pick: z.enum(["good", "all"]).default("good") }), await json(req));
+      const { bundle, graph, written } = await dataset(body.boardId, body.agentNodeId, "chat", body.pick);
+      const node = graph.nodes.find((n): n is ModelNode => n.id === body.modelNodeId && n.kind === "model");
+      if (!node || node.data.endpoint !== "cloud") throw new HttpError(409, "Pick one of the board's cloud models to train with");
+      const key = (await secrets.env())[node.data.apiKeyEnv];
+      if (!key) throw new HttpError(409, `Save ${node.data.apiKeyEnv} in Settings → API keys first`);
+      if (written.examples < MIN_EXAMPLES) throw new HttpError(409, `Fine-tuning needs at least ${MIN_EXAMPLES} ${body.pick === "good" ? "good " : ""}conversations; ${bundle.agent.data.displayName || bundle.agent.data.name} has ${written.examples}. Rate answers in Chat or add checks`);
+      const provider = node.data.label || new URL(node.data.baseUrl).hostname;
+      try {
+        const started = await startFineTune(fetch, {
+          baseUrl: node.data.baseUrl, key, provider, jsonl: await readFile(written.path, "utf8"), fileName: written.file, model: body.baseModel, suffix: trainSuffix(bundle.agent.data.name),
+        });
+        const now = Date.now();
+        const job: TrainJob = {
+          id: newTrainId(), boardId: graph.id, agentNodeId: bundle.agent.id, profile: bundle.agent.data.name, provider, baseUrl: node.data.baseUrl, keyEnv: node.data.apiKeyEnv,
+          baseModel: body.baseModel, model: null, remoteId: started.remoteId, status: started.status, error: null, examples: written.examples, dataset: written.file, createdAt: now, updatedAt: now,
+        };
+        await trainStore.put(job);
+        return job;
+      } catch (err) {
+        if (err instanceof TrainError) throw new HttpError(err.status, err.message);
+        throw new HttpError(502, `Couldn't reach ${provider}: ${(err as Error).message}`);
+      }
+    },
+    "POST /api/train/cancel": async (req): Promise<TrainJob> => {
+      const body = parse(z.object({ id: z.string() }), await json(req));
+      const job = (await trainStore.all()).find((j) => j.id === body.id);
+      if (!job) throw new HttpError(404, "No such training job");
+      const key = (await secrets.env())[job.keyEnv];
+      if (!key) throw new HttpError(409, `Save ${job.keyEnv} in Settings → API keys first`);
+      try {
+        await cancelFineTune(fetch, { baseUrl: job.baseUrl, key, remoteId: job.remoteId });
+      } catch (err) {
+        throw new HttpError(409, (err as Error).message);
+      }
+      Object.assign(job, { status: "cancelled", updatedAt: Date.now() });
+      await trainStore.put(job);
+      return job;
+    },
+
+    "GET /api/fs/roots": async (_req, url): Promise<FsRoot[]> => {
+      const boardId = await requireBoard(url.searchParams.get("boardId"));
+      const { bundles } = await bundlesOf(boardId);
+      const manifest = await readManifest(cfg.hermesHome);
+      const profiles: FsRoot[] = bundles
+        .filter((b) => manifest?.profiles.includes(b.agent.data.name))
+        .map((b) => ({ id: `profile:${b.agent.data.name}`, kind: "profile", name: b.agent.data.displayName || b.agent.data.name, path: join(cfg.hermesHome, "profiles", b.agent.data.name), nodeId: b.agent.id }));
+      const shared: FsRoot = { id: "workspace:files", kind: "workspace", name: "Shared files", path: join(cfg.workspace, "files") };
+      return [...profiles, shared, ...(await folders.opened())];
+    },
+    "POST /api/fs/roots": async (req): Promise<FsRoot> => {
+      const { path } = parse(z.object({ path: z.string().trim().min(1) }), await json(req));
+      return folders.open(path);
+    },
+    /** The Browser view asks whether a site lets itself be shown in a frame (host only). */
+    "GET /api/web/frameable": async (_req, url) => {
+      const target = parse(z.string().url().refine((u) => /^https?:\/\//i.test(u), "http(s) only"), url.searchParams.get("url"));
+      return frameable(target);
+    },
+    /** The folder picker: subfolders of one folder (default: home). Host only. */
+    "GET /api/fs/browse": async (_req, url) => browseFolders(url.searchParams.get("path")),
+    "POST /api/fs/roots/close": async (req) => {
+      const { id } = parse(z.object({ id: z.string().startsWith("folder:") }), await json(req));
+      await folders.close(id);
+      return { ok: true };
+    },
+    "GET /api/fs/list": async (_req, url): Promise<FsListing> => {
+      const rootId = url.searchParams.get("root") ?? "";
+      const rel = url.searchParams.get("path") ?? "";
+      const manifest = await readManifest(cfg.hermesHome);
+      const dir = await folders.resolveRoot(rootId, manifest?.profiles ?? []);
+      const owned = new Set(manifest?.files.map((f) => f.path) ?? []);
+      const profile = rootId.startsWith("profile:") ? `profiles/${rootId.slice(8)}/` : null;
+      const { entries, truncated } = await folders.list(dir, rel, (p) => !!profile && owned.has(profile + p));
+      return { root: rootId, path: rel, entries, truncated };
+    },
+    "GET /api/fs/read": async (_req, url): Promise<FsPreview> => {
+      const manifest = await readManifest(cfg.hermesHome);
+      const dir = await folders.resolveRoot(url.searchParams.get("root") ?? "", manifest?.profiles ?? []);
+      return folders.read(dir, url.searchParams.get("path") ?? "");
+    },
+    /** The code editor's save: opened folders, shared files, an agent's settings (the board follows) and workspace/. */
+    "PUT /api/fs/write": async (req): Promise<{ path: string; bytes: number; sha256: string; followed?: string[] }> => {
+      const body = parse(z.object({ root: z.string(), path: z.string().min(1).max(1000), text: z.string().max(5_000_000), baseSha256: z.string().nullable() }), await json(req));
+      const manifest = await readManifest(cfg.hermesHome);
+      const dir = await folders.resolveRoot(body.root, manifest?.profiles ?? []);
+      const saved = await folders.write(body.root, dir, body.path, body.text, body.baseSha256);
+      // An agent's settings: the board follows at once (the watcher would within seconds).
+      const profile = /^profile:(.+)$/.exec(body.root)?.[1];
+      if (profile && manifest && !saved.path.startsWith("workspace/") && (await relay.exists(manifest.graphId))) {
+        const change = await hermesSync.follow(manifest.graphId, profile).catch(() => null);
+        return { ...saved, followed: change?.changed ?? [] };
+      }
+      return saved;
+    },
+    /** Files dropped or picked into a folder: the bytes as the body, the name in the query; never over a file. */
+    "POST /api/fs/upload": async (req, url) => {
+      const root = url.searchParams.get("root") ?? "";
+      const dir = await folders.resolveRoot(root, (await readManifest(cfg.hermesHome))?.profiles ?? []);
+      const data = await rawBody(req, FILE_MAX_BYTES);
+      return folders.add(root, dir, url.searchParams.get("dir") ?? "", url.searchParams.get("name") ?? "", data);
+    },
+    "POST /api/fs/mkdir": async (req) => {
+      const body = parse(z.object({ root: z.string(), dir: z.string().max(1000), name: z.string().min(1).max(255) }), await json(req));
+      const dir = await folders.resolveRoot(body.root, (await readManifest(cfg.hermesHome))?.profiles ?? []);
+      return folders.mkdir(body.root, dir, body.dir, body.name);
+    },
+    "POST /api/fs/rename": async (req) => {
+      const body = parse(z.object({ root: z.string(), from: z.string().min(1).max(1000), to: z.string().min(1).max(1000) }), await json(req));
+      const dir = await folders.resolveRoot(body.root, (await readManifest(cfg.hermesHome))?.profiles ?? []);
+      return folders.rename(body.root, dir, body.from, body.to);
+    },
+    /** Delete: the item waits in <workspace>/.trash for Undo (`/api/fs/restore`). */
+    "POST /api/fs/delete": async (req) => {
+      const body = parse(z.object({ root: z.string(), path: z.string().min(1).max(1000) }), await json(req));
+      const dir = await folders.resolveRoot(body.root, (await readManifest(cfg.hermesHome))?.profiles ?? []);
+      return folders.remove(body.root, dir, body.path);
+    },
+    "POST /api/fs/restore": async (req) => {
+      const { trash } = parse(z.object({ trash: z.string().max(40) }), await json(req));
+      return folders.restore(trash, (await readManifest(cfg.hermesHome))?.profiles ?? []);
+    },
+  };
+
+  async function hermesInfo(): Promise<HermesInfo> {
+    const bin = await findHermes();
+    const src = bundledSource();
+    return {
+      kind: bin?.kind ?? null,
+      path: bin?.kind === "bundled" ? src?.dir ?? null : bin?.path ?? null,
+      upstream: src ? await bundledUpstream() : null,
+      root: cfg.hermesHome,
+      managedRoot: cfg.managedRoot,
+      gateway: await gatewayStatus(cfg.hermesHome),
+      source: !!src,
+      installed: !!process.env.MCBOT_HERMES_BUNDLE,
+      setup: { state: setupJob.state, lines: setupJob.lines.slice(-30) },
+    };
+  }
+
+  /**
+   * Hermes' gateway seeds bundled skills only into its own home, so each compiled profile gets
+   * them here, once (`skills opt-in --sync`), unless its board turned them off. Serialized.
+   */
+  let seeding: Promise<void> = Promise.resolve();
+  const seedSkills = (graph: unknown, names: string[]) => (seeding = seeding.then(async () => {
+    const off = new Set(resolveGraph(graph as Graph).bundles.filter((b) => b.agent.data.builtinSkills === false).map((b) => b.agent.data.name));
+    const todo = names.filter((n) => !off.has(n) && !bundledSeeded(join(cfg.hermesHome, "profiles", n)));
+    if (!todo.length) return;
+    const found = await findHermes();
+    if (!found) return;
+    const bin = await prepareHermes(found, cfg.hermesHome);
+    for (const name of todo) {
+      const r = await runKanban(bin, cfg.hermesHome, ["-p", name, ...SEED_ARGV], "", 5 * 60_000);
+      console.log(`[engine] ${name}: bundled skills ${r.code === 0 ? "seeded" : `not seeded: ${kanbanError(r)}`}`);
+    }
+  }).catch(() => undefined));
+
+  /** A board's harness versions (src/harness/versions.ts), oldest first; none yet = []. */
+  async function readVersions(boardId: string): Promise<HarnessVersion[]> {
+    try {
+      const v = JSON.parse(await readFile(join(cfg.workspace, "versions", `${boardId}.json`), "utf8")) as { versions?: HarnessVersion[] };
+      return Array.isArray(v.versions) ? v.versions : [];
+    } catch {
+      return [];
+    }
+  }
+  const writeVersions = (boardId: string, versions: HarnessVersion[]) =>
+    atomicWrite(join(cfg.workspace, "versions", `${boardId}.json`), `${JSON.stringify({ versions })}\n`);
+  /** After a compile: a new version when the harness changed since the last one. */
+  async function recordVersion(boardId: string, graph: Graph): Promise<void> {
+    const before = await readVersions(boardId);
+    const after = addVersion(before, graph, Date.now());
+    if (after.length !== before.length || after.at(-1)?.id !== before.at(-1)?.id) await writeVersions(boardId, after);
+  }
+
+  async function compileBoard(boardId: string, dryRun: boolean): Promise<CompileResponse> {
+    const graph = await relay.graph(boardId);
+    const { issues } = resolveGraph(graph);
+    if (issues.some((i) => i.level === "error")) return { ok: false, issues, error: "The board has errors" };
+    try {
+      const report = await writeCompileResult(compile(graph), cfg.hermesHome, { dryRun });
+      const configChanged = report.changes.some((c) => c.path.endsWith("/config.yaml") && c.status !== "unchanged");
+      if (!dryRun && configChanged) runner.markGatewayStale();
+      if (!dryRun) await atomicWrite(join(cfg.workspace, "compiles", `${boardId}.json`), `${JSON.stringify({ at: Date.now(), report }, null, 2)}\n`);
+      if (!dryRun) await recordVersion(boardId, graph);
+      if (!dryRun) await hermesSync.remember(report.profiles.map((p) => p.name));
+      if (!dryRun) void syncAgents();
+      if (!dryRun) void seedSkills(graph, report.profiles.map((p) => p.name));
+      return { ok: true, report, issues, gateway: !dryRun && configChanged && cfg.managedRoot ? "restart-pending" : "unchanged" };
+    } catch (err) {
+      if (err instanceof OwnershipError) return { ok: false, issues, error: err.message };
+      throw err;
+    }
+  }
+
+  const cors = (req: IncomingMessage, res: ServerResponse) => {
+    const origin = req.headers.origin;
+    if (origin && allowed.has(origin)) {
+      res.setHeader("access-control-allow-origin", origin);
+      res.setHeader("vary", "origin");
+      res.setHeader("access-control-allow-headers", "content-type, authorization");
+      res.setHeader("access-control-allow-methods", "GET, POST, PUT, OPTIONS");
+    }
+  };
+  const refusedSeen = new Set<string>();
+  const permitted = (req: IncomingMessage) => {
+    const ok = LOOPBACK_HOST.test(req.headers.host ?? "") && (!req.headers.origin || allowed.has(req.headers.origin));
+    const key = `${req.headers.origin ?? "-"} ${req.headers.host ?? "-"}`;
+    if (!ok && !refusedSeen.has(key)) {
+      // Once per origin/host pair, so a refused page names what it would take to allow it.
+      refusedSeen.add(key);
+      console.warn(`[engine] refused origin ${JSON.stringify(req.headers.origin ?? null)} host ${JSON.stringify(req.headers.host ?? null)} (allow an origin with MCBOT_ALLOWED_ORIGINS)`);
+    }
+    return ok;
+  };
+
+  const deny = (res: ServerResponse, status: number, error: string) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify({ error }));
+  /** A teammate's key: `Authorization: Bearer <key>`, or `?key=` where a header cannot be set (WebSocket, SSE). */
+  const keyOf = (req: IncomingMessage, url: URL) => /^Bearer\s+(\S+)$/.exec(req.headers.authorization ?? "")?.[1] ?? url.searchParams.get("key");
+  /** Where a join came from, for its rate limit: through the tunnel, Cloudflare names the person's address. */
+  const clientOf = (req: IncomingMessage) => {
+    const ip = req.socket.remoteAddress ?? "";
+    const cf = req.headers["cf-connecting-ip"];
+    return /^(::ffff:)?127\.|^::1$/.test(ip) ? `tunnel:${typeof cf === "string" ? cf : "-"}` : ip;
+  };
+  /** May a page from this Origin use the share port? McBot's windows, and this port's own addresses. */
+  const shareOrigin = async (origin: string | undefined) => !origin || allowed.has(origin) || (await sharing.origins()).has(origin);
+  const sendJson = (res: ServerResponse, body: unknown) => void res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" }).end(JSON.stringify(body));
+
+  /** The app, for people who open a link in a web browser: static files, no data (it asks for a key). */
+  const serveApp = async (req: IncomingMessage, res: ServerResponse, url: URL) => {
+    const page = APP_PAGES.test(url.pathname);
+    if (!hasWebApp(cfg.webDir)) {
+      if (!page) return deny(res, 404, "not found");
+      return void res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
+        "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      }).end(joinPage(await hostName()));
+    }
+    const file = webFile(cfg.webDir, page ? "/index.html" : url.pathname);
+    if (!file) return deny(res, 404, "not found");
+    const html = file.type.startsWith("text/html");
+    res.writeHead(200, {
+      "content-type": file.type, "x-content-type-options": "nosniff",
+      "cache-control": html ? "no-store" : file.immutable ? "public, max-age=31536000, immutable" : "no-cache",
+      // The link's code is in the address: no Referer carries it to another site.
+      ...(html ? { "content-security-policy": pagePolicy(req.headers.host ?? ""), "referrer-policy": "no-referrer", "x-frame-options": "DENY" } : {}),
+    });
+    createReadStream(file.abs).pipe(res);
+  };
+
+  /**
+   * Every request. `shared`: it came in on the network port, from a teammate's McBot: an allowed
+   * Origin, a member key (except to join), and only the routes a member may use.
+   */
+  const handle = async (req: IncomingMessage, res: ServerResponse, shared: boolean) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    cors(req, res);
+    if (shared) {
+      // The link opened in a web browser: the app itself (or, without it, how to join from McBot).
+      if (req.method === "GET" && !url.pathname.startsWith("/api/")) return serveApp(req, res, url);
+      const origin = req.headers.origin;
+      if (!(await shareOrigin(origin))) return deny(res, 403, "origin not allowed");
+      if (req.method === "OPTIONS") return void res.writeHead(204).end();
+      // Before joining: whose McBot this is (the join page says so). No data.
+      if (req.method === "GET" && url.pathname === "/api/share/hello") return sendJson(res, { host: await hostName(), web: hasWebApp(cfg.webDir) });
+      if (req.method === "POST" && url.pathname === "/api/join") {
+        try {
+          const body = parse(z.object({ code: z.string().max(24), name: z.string().max(64).default("") }), await json(req));
+          const joined = await sharing.join(body.code, body.name, Date.now(), clientOf(req));
+          if (!joined) return deny(res, 403, "That link is wrong, old or was replaced. Ask for a new one.");
+          console.log(`[engine] ${joined.member.name} joined (${joined.member.role === "chat" ? "can chat" : "can edit"})`);
+          return sendJson(res, { key: joined.key, name: joined.member.name, role: joined.member.role, host: await hostName() });
+        } catch (err) {
+          return deny(res, err instanceof HttpError ? err.status : 400, (err as Error).message);
+        }
+      }
+      // Same-origin GETs from the app in a browser carry no Origin; the member key is what counts.
+      const member = await sharing.member(keyOf(req, url));
+      if (!member) return deny(res, origin ? 401 : 403, "not a member of this computer's boards");
+      if (!guestAllowed(req.method ?? "", url.pathname, member.role)) return deny(res, 403, member.role === "chat" ? "Guests can only chat" : "Only the person sharing can do that");
+      memberOf.set(req, member);
+    } else {
+      if (!permitted(req)) return deny(res, 403, "origin or host not allowed");
+      if (req.method === "OPTIONS") return void res.writeHead(204).end();
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/events") {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      res.write(": connected\n\n");
+      sse.set(res, memberOf.get(req) ?? null);
+      const keep = setInterval(() => res.write(": ping\n\n"), 15_000);
+      req.on("close", () => {
+        clearInterval(keep);
+        sse.delete(res);
+      });
+      return;
+    }
+    // An image, video or sound in a folder, streamed as itself for the Files view's preview (host only).
+    if (req.method === "GET" && url.pathname === "/api/fs/raw") {
+      try {
+        const dir = await folders.resolveRoot(url.searchParams.get("root") ?? "", (await readManifest(cfg.hermesHome))?.profiles ?? []);
+        const file = await folders.raw(dir, url.searchParams.get("path") ?? "");
+        res.writeHead(200, { "content-type": file.type, "content-length": file.size, "cache-control": "no-store", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'" });
+        createReadStream(file.abs).pipe(res);
+      } catch (err) {
+        const status = err instanceof FolderError ? err.status : 500;
+        res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify({ error: (err as Error).message }));
+      }
+      return;
+    }
+    // An image or video an agent made, streamed as itself (the chat shows it from a blob URL).
+    if (req.method === "GET" && url.pathname === "/api/media") {
+      try {
+        const profile = url.searchParams.get("profile") ?? "";
+        const guest = memberOf.get(req);
+        if (guest?.role === "chat") {
+          // A guest sees what their agent made for them: a file one of their own runs names.
+          const path = JSON.stringify(url.searchParams.get("path") ?? "").slice(1, -1);
+          if (!path || !(await guestAgents(guest)).some((a) => a.name === profile)) throw new MediaError(404, "not found");
+          const mine = (await store.list(guest.boardId)).filter((r) => r.by === guest.id && r.profile === profile);
+          let named = false;
+          for (const r of mine) if (JSON.stringify(await store.events(r.runId)).includes(path)) { named = true; break; }
+          if (!named) throw new MediaError(404, "not found");
+        }
+        const manifest = await readManifest(cfg.hermesHome);
+        if (!manifest?.profiles.includes(profile)) throw new MediaError(404, `no compiled agent ${profile}`);
+        const file = await mediaFile(join(cfg.hermesHome, "profiles", profile), url.searchParams.get("path") ?? "");
+        res.writeHead(200, { "content-type": file.type, "content-length": file.size, "cache-control": "private, max-age=3600", "x-content-type-options": "nosniff" });
+        createReadStream(file.abs).pipe(res);
+      } catch (err) {
+        const status = err instanceof MediaError ? err.status : 500;
+        res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify({ error: (err as Error).message }));
+      }
+      return;
+    }
+    const runMatch = /^\/api\/runs\/(run_[a-z0-9]+_[a-f0-9]+)(\/cancel|\/approval|\/reply)?$/.exec(url.pathname);
+    const guest = memberOf.get(req);
+    if (runMatch && guest?.role === "chat" && !(await ownsRun(guest, runMatch[1]!))) return deny(res, 404, "no such run");
+    try {
+      let body: unknown;
+      if (runMatch && req.method === "GET" && !runMatch[2]) body = guest?.role === "chat" ? (await store.events(runMatch[1]!)).map(forGuest) : await store.events(runMatch[1]!);
+      else if (runMatch && req.method === "POST" && runMatch[2] === "/cancel") body = { cancelled: runner.cancel(runMatch[1]!) || (await endOrphan(runMatch[1]!)) };
+      else if (runMatch && req.method === "POST" && runMatch[2] === "/approval") {
+        // An approval card's answer: once, session, always or deny.
+        const { choice } = parse(z.object({ choice: z.enum(["once", "session", "always", "deny"]) }), await json(req));
+        try {
+          await runner.answer(runMatch[1]!, choice);
+        } catch (err) {
+          throw new HttpError(409, (err as Error).message);
+        }
+        body = { answered: choice };
+      }
+      else if (runMatch && req.method === "POST" && runMatch[2] === "/reply") {
+        // The answer to what the agent asked (Hermes' clarify): a choice, a JSON array of choices, text, or "" to skip.
+        const { promptId, answer } = parse(z.object({ promptId: z.string().min(1).max(200), answer: z.string().max(16_384) }), await json(req));
+        try {
+          await runner.reply(runMatch[1]!, promptId, answer);
+        } catch (err) {
+          throw new HttpError(409, (err as Error).message);
+        }
+        body = { answered: promptId };
+      }
+      else {
+        const handler = routes[`${req.method} ${url.pathname}`];
+        if (!handler) throw new HttpError(404, `no route ${req.method} ${url.pathname}`);
+        body = await handler(req, url);
+      }
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
+    } catch (err) {
+      const status = err instanceof HttpError || err instanceof FolderError ? err.status : 500;
+      if (status === 500) console.error("[engine]", err);
+      const extra = err instanceof HttpError && err.body && typeof err.body === "object" ? err.body : {};
+      res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify({ error: (err as Error).message, ...extra }));
+    }
+  };
+  const server = createServer((req, res) => void handle(req, res, false));
+
+  const wss = new WebSocketServer({ noServer: true });
+  const upgrade = async (req: IncomingMessage, socket: import("node:stream").Duplex, head: Buffer, shared: boolean) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const m = /^\/board\/([a-z0-9][a-z0-9-]{0,63})$/.exec(url.pathname);
+    // Live events as a WebSocket: for windows that joined (a quick tunnel carries no SSE).
+    const events = url.pathname === "/api/events";
+    const member = shared ? await sharing.member(keyOf(req, url)) : null;
+    // A guest (Can chat) gets their events, never a board.
+    const ok = shared
+      ? !!member && (await shareOrigin(req.headers.origin)) && (events || member.role === "edit")
+      : permitted(req);
+    if ((!m && !events) || !ok) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      if (events) {
+        eventSockets.set(ws, member);
+        // Something every 25 s, so a tunnel never closes it as idle.
+        const keep = setInterval(() => { if (ws.readyState === ws.OPEN) ws.send('{"ping":1}'); }, 25_000);
+        ws.on("close", () => {
+          clearInterval(keep);
+          eventSockets.delete(ws);
+        });
+        ws.send('{"hello":1}');
+        return;
+      }
+      relay.connect(ws, m![1]!).catch((err) => {
+        console.error("[relay]", err);
+        ws.close(1011, "board unavailable");
+      });
+    });
+  };
+  server.on("upgrade", (req, socket, head) => void upgrade(req, socket, head, false));
+
+  /** The network port, open only while sharing is on. */
+  let shareServer: Server | null = null;
+  const shareView = async (): Promise<SharingView> => {
+    const t = tunnel?.view();
+    return { ...(await sharing.view()), tunnel: { state: t?.state ?? "off", error: t?.error ?? null }, web: hasWebApp(cfg.webDir) };
+  };
+  const applySharing = async () => {
+    await applySharePort();
+    // Anyone with the link: a quick tunnel to the share port, unless the host has an address of their own.
+    const { reach, ownUrl } = await sharing.reach();
+    if (shareServer && reach === "internet" && !ownUrl) {
+      if (!tunnel) {
+        const port = (shareServer.address() as AddressInfo).port;
+        tunnel = new Tunnel({
+          port,
+          launch: cfg.launchTunnel ?? ((p) => launchQuickTunnel(toolsDir, p, (line) => console.log(line))),
+          onChange: (v) => console.log(`[share] link for anyone: ${v.state}${v.url ? ` ${v.url}` : ""}${v.error ? ` (${v.error})` : ""}`),
+        });
+      }
+      tunnel.start();
+    } else if (tunnel) {
+      tunnel.stop();
+      tunnel = null;
+    }
+  };
+  const applySharePort = async () => {
+    const on = await sharing.isOn();
+    if (on && !shareServer) {
+      const s2 = createServer((req, res) => void handle(req, res, true));
+      s2.on("upgrade", (req, socket, head) => void upgrade(req, socket, head, true));
+      await new Promise<void>((resolve, reject) => {
+        s2.once("error", reject);
+        s2.listen(sharing.port, "0.0.0.0", () => resolve());
+      }).catch((err: Error) => {
+        console.error(`[engine] could not share on port ${sharing.port}: ${err.message}`);
+        throw new HttpError(409, `Port ${sharing.port} is in use, so this computer cannot share right now`);
+      });
+      shareServer = s2;
+      console.log(`[engine] sharing on the network, port ${sharing.port}`);
+    } else if (!on && shareServer) {
+      const s2 = shareServer;
+      shareServer = null;
+      const closed = new Promise<void>((resolve) => s2.close(() => resolve()));
+      s2.closeAllConnections();
+      await closed;
+      console.log("[engine] stopped sharing");
+    }
+  };
+
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", (err: NodeJS.ErrnoException) =>
+      reject(err.code === "EADDRINUSE" ? new Error(`port ${cfg.port} is in use — is another McBot engine running? Set MCBOT_PORT to use another port.`) : err));
+    server.listen(cfg.port, cfg.host, () => resolve());
+  });
+  const { port } = server.address() as AddressInfo;
+  void syncAgents();
+  await applySharing().catch(() => undefined);
+  return {
+    server,
+    url: `http://${cfg.host}:${port}`,
+    relay,
+    runner,
+    store,
+    close: async () => {
+      hermesSync.stop();
+      tunnel?.stop();
+      for (const res of sse.keys()) res.end();
+      for (const ws of eventSockets.keys()) ws.terminate();
+      for (const c of wss.clients) c.terminate();
+      await relay.flush();
+      await store.flush();
+      if (shareServer) {
+        const s2 = shareServer;
+        shareServer = null;
+        const done = new Promise<void>((resolve) => s2.close(() => resolve()));
+        s2.closeAllConnections();
+        await done;
+      }
+      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+      server.closeAllConnections();
+      await closed;
+    },
+  };
+}

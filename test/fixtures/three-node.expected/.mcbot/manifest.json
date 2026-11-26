@@ -1,0 +1,29 @@
+{
+  "schema": "mcbot.compile/v1",
+  "graphId": "acme-support",
+  "profiles": [
+    "triage"
+  ],
+  "files": [
+    {
+      "path": "profiles/triage/SOUL.md",
+      "sha256": "5b55e9c8c44e41c6ee457ce9a1015884e833130da8c647607deb5f2cbab52f36",
+      "bytes": 472
+    },
+    {
+      "path": "profiles/triage/config.yaml",
+      "sha256": "ddb5c918f1fd11152bc126f89c851cc9e65e1dcb486c2dedaab606a9c3361309",
+      "bytes": 776
+    },
+    {
+      "path": "profiles/triage/profile.yaml",
+      "sha256": "30f6affafe71223bd3592602e25454371ede879cd6722edae0967056dfe73067",
+      "bytes": 74
+    },
+    {
+      "path": "profiles/triage/skills/mcbot/mcbot-studio/SKILL.md",
+      "sha256": "db8175c14a18206a99e7ef5b19a1ed216d74d41dc2aacb5d511913fc986a4bea",
+      "bytes": 7221
+    }
+  ]
+}

@@ -1,0 +1,107 @@
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import type { CompileResult } from "../contracts/compile";
+import { compile } from "../compile";
+import { readHermes, readSkill, splitSoul, type ProfileFiles } from "./read";
+import { AgentDataSchema, BriefSchema } from "../contracts/graph";
+import { renderSoul } from "../compile/soul";
+
+const FIXTURES = join(import.meta.dirname, "../../test/fixtures");
+const graphs = readdirSync(FIXTURES).filter((f) => f.endsWith(".graph.json"));
+
+/** A compiled setup as the engine would read it from disk. */
+function asProfiles(result: CompileResult): ProfileFiles[] {
+  const at = (p: string) => result.files.find((f) => f.path === p)?.content ?? null;
+  return result.profiles.map(({ name, dir }) => ({
+    name,
+    config: at(`${dir}/config.yaml`),
+    soul: at(`${dir}/SOUL.md`),
+    profileYaml: at(`${dir}/profile.yaml`),
+    // As engine/harnessDisk.ts reads them: every folder under skills/, its own SKILL.md or "" (a category).
+    skills: Object.fromEntries(
+      [...new Set(result.files.filter((f) => f.path.startsWith(`${dir}/skills/`)).map((f) => f.path.split("/")[3]!))]
+        .map((d) => [d, at(`${dir}/skills/${d}/SKILL.md`) ?? ""]),
+    ),
+  }));
+}
+
+/** Hermes' files, without compile's header comment (it names the board and node ids). */
+function hermesFiles(result: CompileResult): Record<string, string> {
+  return Object.fromEntries(
+    result.files
+      .filter((f) => f.role !== "manifest" && f.role !== "marker")
+      .map((f) => [f.path, f.role === "config" ? f.content.replace(/^(#.*\n)+/, "") : f.content]),
+  );
+}
+
+describe("Hermes setup → board", () => {
+  it.each(graphs)("%s: compile, read back, compile again gives the same Hermes files", (name) => {
+    const first = compile(JSON.parse(readFileSync(join(FIXTURES, name), "utf8")));
+    const { graph, unshown } = readHermes({ id: first.graphId, name: "read" }, asProfiles(first));
+    expect(unshown).toEqual([]);
+    expect(hermesFiles(compile(graph))).toEqual(hermesFiles(first));
+  });
+
+  it("lists what it cannot show yet instead of dropping it silently", () => {
+    const { graph, unshown } = readHermes({ id: "mine", name: "Mine" }, [{
+      name: "helper",
+      config: "model:\n  provider: openrouter\n  default: some/model\nmemory:\n  provider: honcho\nplatform_toolsets:\n  cli:\n    - web\n    - homeassistant\n",
+      soul: "# Helper\n",
+      profileYaml: null,
+      skills: { research: "not a skill file" },
+    }]);
+    expect(graph.nodes.map((n) => n.kind)).toEqual(["agent"]);
+    expect(unshown.map((u) => u.what)).toEqual(["config.yaml: memory", "skills/research", "model openrouter", "platform_toolsets.cli: homeassistant"]);
+    expect((graph.nodes[0]!.data as { capabilities: string[] }).capabilities).toEqual(["web"]);
+  });
+
+  it("reads how careful an agent is from approvals.mode, and keeps the other approvals keys in Hermes", () => {
+    const read = (approvals: string) => readHermes({ id: "b", name: "B" }, [{
+      name: "helper", config: `approvals:\n${approvals}`, soul: "# Helper\n", profileYaml: null, skills: {},
+    }]);
+    const careOf = (r: ReturnType<typeof read>) => (r.graph.nodes[0]!.data as { approvals?: string }).approvals;
+    // A bare off is false in YAML 1.1; Hermes takes it as "off" (tools/approval_context.py _normalize_approval_mode).
+    expect(careOf(read("  mode: off\n"))).toBe("off");
+    expect(careOf(read("  mode: Manual\n"))).toBe("manual");
+    const odd = read("  mode: auto\n  timeout: 60\n");
+    expect(careOf(odd)).toBeUndefined();
+    expect(odd.unshown.map((u) => u.what)).toEqual(["config.yaml: approvals.mode", "config.yaml: approvals.timeout"]);
+    const kept = read("  mode: smart\n  cron_mode: approve\n");
+    expect(careOf(kept)).toBe("smart");
+    expect(kept.unshown.map((u) => u.what)).toEqual(["config.yaml: approvals.cron_mode"]);
+  });
+
+  it("reads what an agent may never do, and leaves the rest of security in Hermes", () => {
+    const read = (config: string) => readHermes({ id: "b", name: "B" }, [{ name: "helper", config, soul: "# Helper\n", profileYaml: null, skills: {} }]);
+    const data = (r: ReturnType<typeof read>) => r.graph.nodes[0]!.data as { neverRun?: string[]; blockedSites?: string[] };
+    const on = read("approvals:\n  deny:\n    - git push --force*\nsecurity:\n  redact_secrets: true\n  website_blocklist:\n    enabled: true\n    domains:\n      - Bad.example\n");
+    expect(data(on)).toMatchObject({ neverRun: ["git push --force*"], blockedSites: ["bad.example"] });
+    expect(on.unshown.map((u) => u.what)).toEqual(["config.yaml: security.redact_secrets"]);
+    const off = read("security:\n  website_blocklist:\n    enabled: false\n    domains:\n      - old.example\n");
+    expect(data(off).blockedSites).toBeUndefined();
+    expect(off.unshown.map((u) => u.what)).toEqual(["config.yaml: security.website_blocklist.enabled", "config.yaml: security.website_blocklist.domains"]);
+  });
+
+  it("splits the compiled Team section from the agent's own words", () => {
+    const soul = "# Lead\n\nRuns the desk.\n\n## Team\n\nYou can hand work to these agents.\n\n- `writer` (Writer): drafts\n- `editor`";
+    expect(splitSoul(soul)).toEqual({ own: "# Lead\n\nRuns the desk.", team: ["writer", "editor"], brief: null });
+    expect(splitSoul("# Solo")).toEqual({ own: "# Solo", team: [], brief: null });
+    // Text typed after the list is the person's: kept.
+    expect(splitSoul(`${soul}\n\nAlways answer in two sentences.`)).toEqual({ own: "# Lead\n\nRuns the desk.\n\nAlways answer in two sentences.", team: ["writer", "editor"], brief: null });
+  });
+
+  it("reads the board's brief back out of the Shared knowledge section compile writes", () => {
+    const brief = BriefSchema.parse({ who: "Northwind Bakery", goals: "Sell out by noon.\nGrow the newsletter.", channels: "Instagram" });
+    const soul = renderSoul(AgentDataSchema.parse({ name: "lead", soul: "You lead." }), [AgentDataSchema.parse({ name: "writer" })], brief).replace(/\n+$/, "");
+    expect(splitSoul(soul)).toEqual({ own: "You lead.", team: ["writer"], brief });
+    const { graph } = readHermes({ id: "b", name: "B" }, [{ name: "lead", config: null, soul, profileYaml: null, skills: {} }]);
+    expect(graph.brief).toEqual(brief);
+    expect((graph.nodes.find((n) => n.kind === "agent")!.data as { soul: string }).soul).toBe("You lead.");
+  });
+
+  it("reads a SKILL.md the board can hold, and refuses one it cannot", () => {
+    expect(readSkill("---\nname: triage\ndescription: Sort tickets\nversion: 1.2.0\n---\n\nBody\n")).toMatchObject({ name: "triage", version: "1.2.0", body: "Body" });
+    expect(readSkill("---\nname: Bad Name\ndescription: x\n---\n")).toBeNull();
+  });
+});

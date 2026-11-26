@@ -1,0 +1,79 @@
+/**
+ * Ready-made tools: MCP servers people use most, each a tool node in one click. Every entry was
+ * checked on npm (published, not deprecated, licence) and its key variable read from the
+ * package's own README. They run with `npx` on the person's computer: McBot does not ship them.
+ * A key is referenced as `${env:NAME}`, so it is saved in McBot and never written to the board.
+ *
+ * Remote entries (`url`) are hosted MCP servers that need no install and no key: free web search
+ * for every agent from the first minute. Their addresses come from CopilotKit OpenBot's app
+ * catalogue (MIT, server/src/plugins/catalogue.ts), where they ship keyless.
+ */
+import { CONNECTORS } from "../../contracts/connectors.generated";
+import type { GraphNode } from "../../contracts/graph";
+import { newId } from "./defaults";
+
+export interface CatalogTool {
+  id: string;
+  label: string;
+  /** One line: what an agent can do with it. */
+  does: string;
+  group: "Images & video" | "Web" | "Work apps" | "Thinking" | "Your computer" | "Connectors";
+  /** The tool node's name (its `mcp_servers:` key; tools appear as mcp__<name>__*). */
+  name: string;
+  /** npx arguments for a local server; empty for a remote one. */
+  args: string[];
+  /** A hosted MCP server's address (streamable HTTP): no install. */
+  url?: string;
+  /** The key it needs, by the variable the server reads (from its README). A hosted server gets it
+   *  as `Authorization: Bearer ${env:NAME}` (Hermes renders `${env:…}` in headers too). */
+  key?: { env: string; where: string; optional?: boolean };
+  /** Signs in through Hermes (`hermes mcp login <name>`) instead of a key. */
+  oauth?: Record<string, string | number> | true;
+}
+
+export const CATALOG: readonly CatalogTool[] = [
+  { id: "exa", label: "Exa Search", does: "Searches the web and reads pages. Free, no key", group: "Web", name: "exa", args: [], url: "https://mcp.exa.ai/mcp" },
+  { id: "parallel", label: "Parallel Search", does: "Web search with sources for research. Free, no key", group: "Web", name: "parallel", args: [], url: "https://search.parallel.ai/mcp" },
+  { id: "browser", label: "Browser", does: "Opens pages, clicks, fills forms and reads them (Playwright)", group: "Web", name: "browser", args: ["-y", "@playwright/mcp@latest"] },
+  { id: "brave", label: "Brave Search", does: "Searches the web and news", group: "Web", name: "brave", args: ["-y", "@brave/brave-search-mcp-server", "--transport", "stdio"], key: { env: "BRAVE_API_KEY", where: "api-dashboard.search.brave.com" } },
+  { id: "tavily", label: "Tavily", does: "Web search and page extraction made for agents", group: "Web", name: "tavily", args: ["-y", "tavily-mcp"], key: { env: "TAVILY_API_KEY", where: "app.tavily.com" } },
+  { id: "firecrawl", label: "Firecrawl", does: "Turns websites into clean text, crawls whole sites", group: "Web", name: "firecrawl", args: ["-y", "firecrawl-mcp"], key: { env: "FIRECRAWL_API_KEY", where: "firecrawl.dev" } },
+  { id: "context7", label: "Context7", does: "Up-to-date docs for any code library", group: "Web", name: "context7", args: ["-y", "@upstash/context7-mcp"], key: { env: "CONTEXT7_API_KEY", where: "context7.com", optional: true } },
+  // GitHub's own hosted server (github/github-mcp-server, docs/remote-server.md): a token in the header.
+  { id: "github", label: "GitHub", does: "Repos, issues, pull requests and code search", group: "Work apps", name: "github", args: [], url: "https://api.githubcopilot.com/mcp/", key: { env: "GITHUB_PERSONAL_ACCESS_TOKEN", where: "github.com/settings/personal-access-tokens" } },
+  { id: "notion", label: "Notion", does: "Reads and writes your Notion pages and databases", group: "Work apps", name: "notion", args: ["-y", "@notionhq/notion-mcp-server"], key: { env: "NOTION_TOKEN", where: "notion.so/my-integrations" } },
+  { id: "memory", label: "Knowledge graph", does: "A shared memory of people, things and how they relate", group: "Thinking", name: "knowledge", args: ["-y", "@modelcontextprotocol/server-memory"] },
+  { id: "thinking", label: "Step-by-step thinking", does: "Plans hard problems one step at a time", group: "Thinking", name: "thinking", args: ["-y", "@modelcontextprotocol/server-sequential-thinking"] },
+];
+
+const ACRONYMS = new Set(["aws", "ai", "api", "crm", "hr", "mcp", "ui"]);
+/** Connectors whose brand is not spelled like its key. */
+const BRANDS: Record<string, string> = {
+  alltrails: "AllTrails", betterstack: "Better Stack", circleci: "CircleCI", clickup: "ClickUp", deepwiki: "DeepWiki", gitlab: "GitLab",
+  hugging_face: "Hugging Face", motherduck: "MotherDuck", "n8n-official": "n8n", paypal: "PayPal", "prisma-postgres": "Prisma Postgres",
+  rentahuman: "RentAHuman", "wordpress-com": "WordPress.com", monday: "monday.com", "comfy-cloud": "Comfy Cloud",
+};
+export const titled = (name: string) => BRANDS[name] ?? name.split(/[-_]/).map((w) => (ACRONYMS.has(w) ? w.toUpperCase() : w.charAt(0).toUpperCase() + w.slice(1))).join(" ");
+
+/**
+ * Hermes' own vetted connectors (hermes/optional-mcps, generated): hosted MCP servers, most of them
+ * signed in to with the service's own login (OAuth, through Hermes), none needing a key in McBot.
+ */
+/** Connectors that make pictures and video (Hugging Face's Spaces, Comfy Cloud): first in the catalog, and offered in setup. */
+export const MEDIA_CONNECTORS = new Set(["hugging_face", "comfy-cloud"]);
+export const CONNECTOR_TOOLS: readonly CatalogTool[] = CONNECTORS.map((c) => ({
+  id: `connector-${c.name}`, label: titled(c.name), does: c.name === "hugging_face" ? "Make images and video with Spaces (FLUX and more), and find models. Free with an account" : c.does,
+  group: MEDIA_CONNECTORS.has(c.name) ? "Images & video" as const : "Connectors" as const, name: c.name, args: [], url: c.url,
+  ...(c.auth === "oauth" ? { oauth: c.oauth ?? true } : {}),
+}));
+
+export function catalogNode(t: CatalogTool, taken: ReadonlySet<string>, position: { x: number; y: number }): GraphNode {
+  let name = t.name;
+  for (let i = 2; taken.has(name); i++) name = `${t.name}-${i}`;
+  return {
+    id: newId("tool"), kind: "tool", position,
+    data: t.url
+      ? { name, label: t.label, transport: "http", command: "", args: [], env: {}, url: t.url, headers: t.key ? { Authorization: `Bearer \${env:${t.key.env}}` } : {}, ...(t.oauth ? { auth: "oauth" as const, ...(t.oauth === true ? {} : { oauth: { ...t.oauth } }) } : {}) }
+      : { name, label: t.label, transport: "stdio", command: "npx", args: [...t.args], env: t.key ? { [t.key.env]: `\${env:${t.key.env}}` } : {}, url: "", headers: {} },
+  };
+}

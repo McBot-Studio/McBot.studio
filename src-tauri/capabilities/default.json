@@ -1,0 +1,20 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "McBot windows: core APIs (and the window's zoom, Settings → Size); opening https pages in the system browser (Report a problem, Get Ollama) and a mailto: draft (Email invite); showing an exported board in Finder or Explorer; system notifications when agents finish or need the person. The engine is reached over loopback HTTP/WebSocket, not IPC.",
+  "windows": ["main", "board-*", "island"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-minimize",
+    "core:window:allow-maximize",
+    "core:window:allow-unmaximize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-is-maximized",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:webview:allow-set-webview-zoom",
+    { "identifier": "opener:allow-open-url", "allow": [{ "url": "https://*" }, { "url": "http://localhost*" }, { "url": "http://127.0.0.1*" }, { "url": "mailto:*" }] },
+    "opener:allow-reveal-item-in-dir",
+    "notification:default"
+  ]
+}

@@ -1,0 +1,115 @@
+/**
+ * The keys (and chat-app settings) an agent needs, in that agent's `<profile>/.env`.
+ *
+ * Hermes' gateway serves every profile of a root from one process and reads a
+ * served profile's credentials from that profile's `.env` only: it never falls
+ * back to its own environment for them (agent/secret_scope.py get_secret,
+ * build_profile_secret_scope). So a key McBot passes as a run's environment
+ * variable never reaches an agent; it has to be in the profile's `.env`.
+ *
+ * The engine writes, inside a marked block, the keys that agent's board names
+ * (its models' key variables, its makers' keys, `${env:NAME}` in its MCP
+ * servers) and that the user saved in McBot, plus each chat app's bot token
+ * under the platform's own variable and its allowed users. It does so right
+ * before each run, after a compile and after a key is saved (a bot must be
+ * reachable without a run; the gateway re-reads a served profile's .env).
+ * Lines outside the block (keys someone added with Hermes itself) are kept.
+ * The file is owner-only, and the Files view never lists or shows it.
+ */
+import { chmod, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { MEDIA_PROVIDERS, PLATFORMS, channelKeyName } from "../src/contracts/graph";
+import type { AgentBundle } from "../src/compile";
+import { readTextOrNull } from "./fsutil";
+
+export const ENV_BEGIN = "# >>> McBot keys: rewritten before each run; change them in McBot";
+export const ENV_END = "# <<< McBot keys";
+
+/** Files that hold keys, never listed or shown (src/harness/live.ts, shared with the app). */
+export { SECRET_FILES } from "../src/harness/live";
+
+const ENV_REF = /\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g;
+
+/**
+ * One line of an agent's McBot block: a saved key under its own or another name, or a plain
+ * setting that only makes sense next to a key (a bot's allowed users without its token).
+ */
+export type EnvEntry = { name: string; secret: string } | { name: string; value: string; with?: string };
+
+/** Everything an agent's .env should hold from the board, sorted by variable name. */
+export function envEntriesFor(bundle: AgentBundle): EnvEntry[] {
+  const out = new Map<string, EnvEntry>();
+  const secret = (name: string, from = name) => out.set(name, { name, secret: from });
+  for (const m of bundle.models) if (m.data.apiKeyEnv) secret(m.data.apiKeyEnv);
+  for (const maker of [bundle.image, bundle.video]) {
+    if (!maker) continue;
+    const p = (MEDIA_PROVIDERS[maker.data.media] as Record<string, { keyEnv: string } | undefined>)[maker.data.provider];
+    if (p) secret(p.keyEnv);
+  }
+  for (const t of bundle.tools)
+    for (const v of [...Object.values(t.data.env), ...Object.values(t.data.headers)])
+      for (const m of v.matchAll(ENV_REF)) secret(m[1]!);
+  // A chat app: its secrets (saved in McBot), its plain settings and who may message it, under the
+  // variables its Hermes platform plugin declares (src/contracts/platforms.generated.ts). Settings
+  // go in only with its first secret, so a bot without its token does not half-start.
+  for (const c of bundle.channels) {
+    const p = PLATFORMS[c.data.platform];
+    const first = p.required.find((f) => f.secret)?.env ?? null;
+    for (const f of p.required) {
+      if (f.secret) secret(f.env, channelKeyName(c.data, f.env));
+      else if (c.data.settings[f.env]?.trim()) out.set(f.env, first ? { name: f.env, value: c.data.settings[f.env]!.trim(), with: first } : { name: f.env, value: c.data.settings[f.env]!.trim() });
+    }
+    if (p.allowedUsersEnv && c.data.allowedUsers.length) {
+      const value = c.data.allowedUsers.join(",");
+      out.set(p.allowedUsersEnv, first ? { name: p.allowedUsersEnv, value, with: first } : { name: p.allowedUsersEnv, value });
+    }
+  }
+  return [...out.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/** The block's values: saved keys that exist, and settings whose key made it in. */
+export function resolveEntries(entries: readonly EnvEntry[], saved: Readonly<Record<string, string>>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const e of entries) if ("secret" in e && e.secret in saved) out[e.name] = saved[e.secret]!;
+  for (const e of entries) if ("value" in e && (e.with === undefined || e.with in out) && e.value) out[e.name] = e.value;
+  return out;
+}
+
+/** Does this agent have a chat app with every secret saved and every setting filled in? */
+export function hasLiveChannel(bundle: AgentBundle, saved: Readonly<Record<string, string>>): boolean {
+  return bundle.channels.some((c) =>
+    PLATFORMS[c.data.platform].required.every((f) => (f.secret ? channelKeyName(c.data, f.env) in saved : !!c.data.settings[f.env]?.trim())));
+}
+
+/** Hermes' dotenv subset: double quotes with \" and \\ escapes (agent/secret_scope.py _parse_env_value). */
+const quote = (v: string) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+
+/** `existing` with McBot's block replaced by `values` (removed when empty), always at the end. */
+export function withKeys(existing: string, values: Readonly<Record<string, string>>): string {
+  const kept: string[] = [];
+  let inBlock = false;
+  for (const line of existing.split(/\r?\n/)) {
+    if (line === ENV_BEGIN) inBlock = true;
+    else if (line === ENV_END) inBlock = false;
+    else if (!inBlock) kept.push(line);
+  }
+  while (kept.length && kept.at(-1) === "") kept.pop();
+  const names = Object.keys(values).sort();
+  const block = names.length ? [ENV_BEGIN, ...names.map((n) => `${n}=${quote(values[n]!)}`), ENV_END] : [];
+  const lines = [...kept, ...(kept.length && block.length ? [""] : []), ...block];
+  return lines.length ? `${lines.join("\n")}\n` : "";
+}
+
+/** Write the keys for one profile. `profileDir` must already exist (compile made it). */
+export async function writeProfileKeys(profileDir: string, values: Readonly<Record<string, string>>): Promise<void> {
+  const file = join(profileDir, ".env");
+  const before = (await readTextOrNull(file)) ?? "";
+  const after = withKeys(before, values);
+  if (after === before) return;
+  if (!after) {
+    await unlink(file).catch(() => undefined);
+    return;
+  }
+  await writeFile(file, after, { mode: 0o600 });
+  await chmod(file, 0o600).catch(() => undefined); // no-op on Windows
+}

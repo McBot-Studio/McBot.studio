@@ -1,0 +1,418 @@
+# McBot plan
+
+**McBot is the command center for your AI team.** You build agents as a graph,
+they run on the Hermes engine inside the app, and you work with them in one
+clean, Mac-style window: chat, tasks, browser, terminal, code, files and apps.
+One download, free and open source, for one person or a whole company.
+
+Hermes runs the agents; McBot makes them visible, connected and easy to steer.
+What code comes from which project is in [MERGE.md](MERGE.md); why this order,
+in [NEXT.md](NEXT.md). Updated 2026-11-06 from the owner's vision: an
+orchestration app and AI command center, with a code editor, a terminal and an
+AI browser built in.
+
+The strategy as of 2026-11-24 (features, Hermes coverage, competitors, graph engineering,
+customisation, open models and training, security) is in [STRATEGY.md](STRATEGY.md).
+
+Status: ● working today · ◐ started · ○ planned
+
+## Where McBot stands
+
+- ● **Build:** the editable graph of agents, models, tools, makers and chat
+  apps compiles into real Hermes files, with hashes and diffs.
+- ● **Run and watch:** chat with each agent; runs, memory, files and cost are
+  graphs; the island shows who is working; several windows share one board live.
+- ● **Engine inside:** Hermes ships in the installers and prepares itself on
+  first launch; a setup assistant gets a person to a working team.
+- ● **Brand:** the gray glass burger logo, agents as glass food bots, the website.
+- ◐ **Ship:** installers build for macOS, Windows and Linux, but v0.1.0 is an
+  unpublished draft, and no one has installed it on a real Mac or PC yet.
+
+## Now: fix and finish before new features
+
+These come first, because every later feature depends on people being able to
+install McBot, trust it and keep it up to date.
+
+1. **Publish v0.1.0.** Owner: set the draft's Target to the default branch and
+   publish it; the website's download buttons then appear.
+2. **Install it on a real Mac and PC.** Download, open, setup assistant, engine
+   preparation, first answer. Write down every snag and fix it.
+3. **A faster, sturdier first launch.** Preparing the engine takes minutes and
+   needs internet. ● A run that starts during preparation waits for it instead
+   of setting the engine up a second time, and says so; the smoke test measures
+   it on macOS, Windows and Linux (here: prepared in 51 s, first answer in 12 s).
+   ○ Explain offline errors, start the gateway right after preparing (most of
+   the first answer's 12 s), and consider shipping the prepared runtime per platform.
+4. **Updates.** The Tauri updater, signed with an update key (the release logs
+   say "Signature not found for the updater JSON"), and "Update available" in the app.
+5. **Signing (decision 2).** Apple Developer ID with notarization, and a Windows
+   signature, remove the one-time "Open Anyway" and "Run anyway" warnings.
+6. ● **Engine sync.** `hermes/` is on the v0.23.1 release; every patch and every cited source line re-checked.
+7. **Tests on every pull request.** ● `ci.yml` runs the tests, the typecheck
+   and both builds on every PR. ● `smoke.yml` runs the built engine, first-launch preparation
+   and a real agent run on macOS, Windows and Linux.
+8. ● **CI upkeep.** The workflows run on Node 24 actions.
+9. ● **Say only what is true.** The website's crew graph shows agents using
+   their models and tools, not hand-offs, until M7 brings them.
+10. ● **When something breaks.** ⌘K → Report a problem: version, system,
+    engine state and the log's last lines, keys hidden, to paste into an issue.
+    Opt-in crash reports later (M11).
+
+## The parts, and how they connect
+
+```
+McBot window (Tauri)
+┌──────┬──────────┬──────────── centre ─────────────┬───────────┐
+│ rail │ sidebar  │ Home · Board · Chat · Tasks ·    │ inspector │
+│      │ (lists)  │ Code · Browser · Studio · Files  │ or agent  │
+│      │          ├──────────── bottom ─────────────┤ chat      │
+│      │          │ Terminal · run log               │           │
+└──────┴──────────┴──────────────────────────────────┴───────────┘
+   │ Rust shell: windows, menu bar, notifications, updater, terminal (PTY)
+   │ HTTP + WebSocket on this computer only
+McBot engine (Node sidecar)
+   compile · runs · board relay · files · keys · media · approvals · tasks
+   │ files on disk + processes
+Hermes (bundled, our fork)
+   agents · memory · skills · tools · browser · kanban · cron · webhooks ·
+   gateway (chat apps) · delegation · approvals · ACP · peer
+   │
+Outside: local and cloud models · MCP apps (Gmail, GitHub, Notion, …) ·
+chat apps · websites · the team server · phones
+```
+
+Every new part keeps the compile rule: what you set on the board becomes Hermes
+files, and Hermes runs them. McBot draws, connects and shows; it does not grow
+a second agent runtime.
+
+### 1. Board: the harness ●
+
+The graph of agents, models, tools, makers and chat apps. ● nodes, wiring,
+fallbacks, compile with hashes and diffs, live cursors.
+○ undo history, multi-select and align, notes and sections, templates,
+agent → agent hand-off edges (M7), trigger, step, condition and approval nodes (M10).
+● Export a board to a file and import it as a new board (`mcbot.graph/v1`
+JSON), the first step toward packs (M13).
+
+### 2. Agents ●
+
+● soul, skills, abilities, memory editor, faces that show run state, keys
+that reach each agent. ◐ role presets (setup assistant).
+○ per-agent knowledge files, permissions (folders, tools, spend), a context
+meter, a model switch that keeps the agent's memory and history.
+
+### 3. Home: the command center ◐ (M7)
+
+The first screen of the day. One glance answers: who is working, what finished,
+what needs me, what it cost, what runs next.
+
+- **Inbox:** approvals, questions agents asked, finished work, failures, each
+  with one action (approve, answer, open, retry).
+- **Live:** every agent with its face and current step; stop or redirect it.
+- **Today:** spend, tokens and runs, updating as each run finishes; the next
+  scheduled jobs.
+- **Ask bar:** "give Triage this", "what did Researcher find?".
+- **Everywhere:** macOS notifications and a menu bar icon with the same inbox.
+
+### 4. Tasks and orchestration ◐ (M7)
+
+Agents work as a team through Hermes' kanban, which already has owners,
+dependencies, review and "changes requested".
+
+- **Tasks view:** the space's kanban board, live; people create and assign tasks too.
+- **Hand-off edges** on the board: manager → specialists, pipelines, swarms.
+- **Queue:** give an agent its next task while it works.
+- **Delegation** drawn in the run graph; **approval cards** answer Hermes'
+  approvals from McBot; **schedules** (Hermes cron) on each agent.
+
+### 5. Workbench: terminal, code and browser ◐ (M8)
+
+Build things in McBot, next to the agents doing the work.
+
+- **Terminal panel:** real shells in the bottom panel (xterm.js, MIT; the PTY in
+  the Rust shell with `portable-pty`, MIT, so the Node engine stays one plain
+  executable). Open a shell in any agent's workspace, or that agent's own Hermes TUI.
+- **Code editor:** tabs and a file tree for any opened folder or agent
+  workspace (decision 3). Review what an agent changed as a diff, accept or
+  undo it, and send a selection to an agent ("fix this", "explain this").
+  Git: show status and diffs; commits stay in the terminal for now. The
+  inspector's long fields (soul, skill instructions) use the same editor;
+  compiled files open read-only, because the next compile rewrites them.
+- **Browser:** a browser pane with two modes.
+  - **Watch:** the agent's own browser, live (Hermes drives Chromium over CDP;
+    screencast frames into the pane), with "take over" and "hand back".
+  - **Browse:** your own tabs in a native webview (Tauri multi-webview), with
+    "send this page to an agent" and "do this here".
+  - **Engines:** Hermes' local Chromium by default; Lightpanda as an optional
+    fast engine the person installs (decision 5); cloud browsers through Hermes.
+- **Preview:** open what an agent built (a web app on localhost, a report) in
+  the browser pane.
+
+### 6. Ask McBot and coding agents ○ (M9)
+
+- **Ask McBot:** in ⌘K and the Home ask bar, a copilot that edits the board:
+  "add a researcher that can search our docs" adds the nodes, wires them and
+  shows the diff before it compiles. It also explains compile errors and failed
+  runs. Speak instead of typing: Hermes already has speech to text.
+- **Coding agents:** Claude Code, Codex and Gemini CLI as agents on the board,
+  through ACP (decision 4), working in the code editor's folder.
+- **Your own AI plan:** run agents on a ChatGPT or Claude plan the person already
+  pays for, instead of an API key (decision 1). Hermes has an optional Codex
+  runtime (`hermes codex-runtime`); what it covers is verified first (hard rule 2).
+
+### 7. Connections and apps ◐ (M6)
+
+● local and cloud models, MCP tool nodes, image and video makers, Obsidian,
+Telegram, saved keys. ◐ local model detection.
+○ the OS keychain for keys; an app catalog of MCP servers (Gmail, Calendar,
+Drive, GitHub, Notion, Slack, Linear, Figma) with sign-in in one click; Hermes'
+skill catalog (about 200 optional skills); WhatsApp, Slack, Discord and email;
+chat-app conversations shown in McBot's chat.
+
+### 8. Data: files, memory, knowledge, Studio ◐
+
+● files of any opened folder as a graph, each agent's memory, cost.
+○ **Knowledge:** company documents agents can search, and shared team memory
+next to each agent's own. ○ **Studio** (M10): everything agents made (images,
+video, audio, documents, drafts) with the run that made it. ○ **Search**
+everything from ⌘K: agents, runs, tasks, files, memory.
+
+### 9. Workflows ○ (M10)
+
+Trigger (schedule, webhook, chat message, new file), step ("give this agent
+this task"), condition and approval nodes on the board, built on kanban and
+Hermes cron, with run history. Posting after approval (social, email, chat).
+
+### 10. Safety and control ◐
+
+● the engine only listens on this computer and checks origins; keys never
+leave the engine. ○ per-agent permissions (tools, folders, spend), budgets and
+alerts, approvals before risky actions, an audit log, secrets in the keychain or
+1Password and Bitwarden (Hermes `secrets`), sandboxed code runs.
+
+### 11. Always on ○ (M11)
+
+Agents keep working when the window is closed: the Hermes gateway as a
+background service, launch at login, the menu bar icon, schedules that run
+overnight, notifications when something needs you.
+
+### 12. Teams and McBot Cloud ○ (M12)
+
+● Share a board on your network with an invite code (M12a), then the team server
+on the Buzz relay (M12b): members, roles per space, audit, presence. McBot Cloud
+is the hosted, always-on version and the paid product ([MERGE.md](MERGE.md)).
+
+### 13. Packs and starter teams ○ (M13)
+
+Export and import agents, skills, tools and workflows as a folder. Starter
+teams (personal assistant, support desk, research, marketing, dev team), and
+import from OpenClaw, Claude Code and Codex (Hermes `migrate`).
+
+### 14. Phones ○ (M14)
+
+Chat, approvals and notifications on iPhone and Android (Buzz mobile, through
+the team server).
+
+### 15. Design and polish ◐ (M15)
+
+● design system: dark, always (the owner dropped the light theme), with macOS's accent colours; a flat
+pro macOS look, rail, ⌘K, graphs everywhere, the logo and agent faces. ○ panes you resize, pin and
+rearrange (centre, right and bottom), tabs in the centre, layouts saved per person, keyboard
+shortcuts for every action, accessibility, languages.
+
+### 16. Shipping and growth ◐
+
+● installers from `release.yml`, the website with the browser demo.
+○ everything in "Now" above; a docs site and changelog; short videos of real
+tasks; starter-team templates on the website; a community place (GitHub
+Discussions or Discord); an opt-in count of first-run successes, so we know
+whether setup works.
+
+## Milestones (build order)
+
+| | Scope | Done when |
+|---|---|---|
+| **M5** ● | Setup assistant, key vault, local model detection, Hermes inside the app, unsigned installers | Someone downloads McBot, answers five questions and talks to a working agent within three minutes, without a terminal |
+| **M6** ◐ | Connections: abilities ●, image and video makers ●, Obsidian ●, keys through each profile's `.env` ●, Telegram ●, every chat app Hermes ships (26: Slack, Discord, WhatsApp, Teams, email…) ●; keychain ○, app catalog with sign-in ◐ (Hermes' 65 connectors, OAuth through Hermes; status ○), skill catalog ● (Hermes' built-in and official library, Skills view), plugins ○ chat-app conversations in McBot ○, context meter ○ | Connecting Gmail or Slack takes one screen, and an agent uses it |
+| **M7** ◐ | Command center and team work: Home (inbox, live, today, ask bar) ●, notifications and the menu bar icon ●; Tasks view on Hermes kanban ●; hand-off edges ●; schedules ●; queue ●; delegation in the run graph ○; approval cards ● (and in the island); a Goal on the lead agent with optional auto-continue ○; spaces ○ | A lead agent splits a goal into tasks for three agents, a person approves the result from the inbox, and a scheduled job runs while they watch Home |
+| **M8** ◐ | Workbench: terminal panel ●, code editor ● (agent diffs ○), browser: preview window ●, watch the agent's browser and take over ○, resizable panes ○ | An agent builds a small web page in a folder; you read its diff in the editor, run it in the terminal and see it in the browser pane, without leaving McBot |
+| **M9** ◐ | ● Ask McBot builds a harness from a description (reviewable plan, Undo; board model or quick plan) and the Layers view; ○ Ask McBot as a Builder for skills and schedules: it writes Hermes skills, agents and schedules (only files McBot already knows), shown as a reviewable board diff the person accepts, with Undo and Restore, one proposal at a time (idea: DeepSeek Harness Creator mode); an optional reviewer agent in front of risky approvals; coding agents through ACP; running agents on a ChatGPT or Claude plan (decisions 1 and 4) | "Add a researcher that can search our docs" changes the board, and a Claude Code agent fixes a bug in the editor's folder |
+| **M10** ○ | Workflows (trigger, step, condition, approval) and Studio (gallery, posting after approval) | A weekly report runs itself and waits for a person's OK before it is sent |
+| **M11** ○ | Always on and launch: background gateway, launch at login, auto-update, signing (decision 2), crash reports, docs site | Agents keep their schedules with the window closed, and McBot updates itself |
+| **M12** ◐ | Teams: share on your network (M12a) ●, the Team panel (who is here, team chat with @agent) ●, then the Buzz team server (M12b); roles, audit; McBot Cloud | Two people on two computers edit and run one board |
+| **M13** ○ | Packs and starter teams; import from other agents | A "Dev team" pack installs into a new space and runs |
+| **M14** ○ | Phones | Approve an agent's action from an iPhone |
+| **M15** ◐ | Polish: the dark design ● (macOS's accent colours; the light theme dropped by the owner), layouts, shortcuts, accessibility, languages (brand and agent icons ● done) | Each person arranges McBot their way, and it remembers |
+| **M16** ○ | Model lab: datasets from your best runs (Hermes' trajectory format), fine-tuning on your own hardware (MLX-LM, Unsloth), serving with Ollama, compared in History (STRATEGY.md) | Your own model beats the cloud one on your work, and runs free |
+
+"Now" runs before and alongside M6. Hermes upstream syncs happen whenever the
+daily watchdog opens an issue.
+
+## Decisions (made by the owner, 2026-11-12)
+
+1. **Your own AI plan: yes.** People can use a ChatGPT or Claude plan they already pay for,
+   only through runtimes the vendor or Hermes ships (Codex runtime, the vendor's own CLI as an
+   agent), never a vendor SDK inside McBot. Hard rule 4 says so now.
+2. **Signing: free only.** Windows: SignPath Foundation's free open-source signing, and the
+   Microsoft Store (free for individual developers). Linux: Flathub. macOS: no free way to
+   avoid Gatekeeper (Developer ID is $99/year; Homebrew now requires notarization), so the Mac
+   download keeps the one-time "Open Anyway" with clear steps until that changes. Phones: an
+   installable web app (iPhone and Android, no store, no warning).
+3. **Code editor: Monaco** (done).
+4. **ACP: yes**, for Claude Code, Codex and Gemini CLI as agents (M9). It is also how a Claude
+   or ChatGPT plan runs in McBot (decision 1).
+5. **Lightpanda: optional**, installed by the person, off by default (done).
+6. **People and companies both come first.** Setup asks which, and the starter teams cover both.
+7. **Teams: network sharing first** (done, M12a), then the team server for remote teams (M12b).
+8. **Name and domain:** McBot, on the cheapest available McBot domain (the owner buys it).
+9. **Hermes is the harness; the board is its live, two-way editor.** McBot exists to see, build
+   and manage AI agents and their whole Hermes setup visually. Hermes' own files (config.yaml,
+   SOUL.md, skills, schedules, chat apps, memory, plugins) are the master copy; the board draws
+   them, edits exactly the keys it changes, keeps the rest, and follows changes made in Hermes
+   (by hand, by the CLI or by agents). Layout, notes and drawings stay on the board. Steps:
+   (a) reader: a Hermes setup becomes a board (done: "Open my Hermes setup");
+   (b) careful writer: compile edits only its own keys and keeps unknown ones (done);
+   (c) watcher: changes in Hermes reach the open board live, and agent files are editable in Code (done);
+   (d) the Library: every ability, skill, chat app, memory and plugin Hermes has, to add (chat apps done: all 26);
+   then Ask McBot builds through the same path.
+
+## Ideas taken from DeepSeek Harness (MIT, 2026-11-12)
+
+Ideas only, no code: it is a Cordis/TypeScript runtime, McBot's engine is Hermes. Taken: the
+Builder with propose-then-confirm cards and Undo/Restore (M9), a static plugin index (M6), a
+per-agent Goal (M7), a reviewer before risky actions (M9). Also added from the audit: session
+search in ⌘K (M7), thumbs up/down on an answer stored with the run (M7), run replay with a
+scrubber (M8), a guard node on an edge that blocks or rewrites a tool call (M10), headless
+`mcbot run <board>` for CI and scripts (M11), voice input in the ask bar (M15), starter teams
+with a "try in the demo" button (M13, moved up). Skipped: plan mode, team board
+(Hermes kanban covers it), forge, terminal, computer use, their UI.
+
+## Ideas from the two OpenBots (2026-11-13)
+
+**CopilotKit/OpenBot (MIT)**: an enterprise workspace for "Bots" (Tauri desktop + Docker backend,
+Postgres, Kubernetes, AG-UI for outside agents, MCP for tools, a separately licensed CopilotKit
+Intelligence for memory and learning). Code may come in with its LICENSE kept, but little fits:
+its stack (Postgres, Docker, Kubernetes, sign-in) is what McBot's stack rules exclude. Taken:
+keyless hosted web search (Exa, Parallel) from its app catalogue, now in the tool catalog (done).
+Ideas for later: a routine as one sentence in four parts, What / Starts / Does (act or only tell
+you) / Until (stop, or an outcome = a goal), on top of Hermes schedules (M7/M10); "kinds of
+action" that always ask — delete, send, share, post, pay, change a password — as approval presets
+over Hermes' approvals (M9); a skill proposed from a conversation the person liked (M9 Builder);
+skills that name a role (`@research/search`) instead of one provider's tool (M6 catalog); a
+standing role sent with every run, so a Bot's job survives a new chat (Hermes SOUL.md does this
+already); "watch the Bot's browser, take over" (M8, planned).
+
+**nightly-labs/openbot (PolyForm Noncommercial)**: features only, never its code (hard rule 1). A
+local-first Electron workspace that runs coding CLIs (Codex, Claude Code, Gemini, Copilot, Hermes
+and more) as agents over ACP. Taken now, rebuilt: a per-agent FIFO message queue in chat (done, M7),
+search of past conversations in ⌘K (done, M7), and a CLI for scripts on the local API
+(`npm run mcbot -- run <agent> … --wait`, done, ahead of M11). Ideas for later: branch a
+conversation from a message (M7; needs a Hermes session fork or a transcript hand-off), a context
+meter with compaction warning (M6, planned), webhook routines with a signed URL per routine (M10),
+reactions and file transfer between agents (M7), theme palette files a script can write (M15),
+prompt-driven agent creation with a review step (M9 Builder), an `mcbot://` link that opens an
+invite in the app (M12).
+
+Where McBot is already ahead of both: the board compiles into a real Hermes setup on disk and reads
+it back (neither has a harness you can see and edit as a graph), cost per agent and model with
+budgets, memory as an editable graph, local models first with one download (CopilotKit's needs
+Docker and a licence; nightly's runs vendor CLIs with full access and no approvals), approvals by
+default, and boards shared live on the network with no account.
+
+## Ideas from Orca (stablyai/orca, MIT, 2026-11-13)
+
+An IDE for running many coding agents side by side (Electron; Claude Code, Codex, OpenCode and
+others, each in its own git worktree). MIT, so code could come in with its LICENSE, but it is an
+editor around coding CLIs; McBot is a harness for any work. Ideas to rebuild, in plan order:
+- **Point at the page** (M8 browser): click an element in the Browser view and send its HTML,
+  styles and selector to an agent's chat as context.
+- **Comment on a diff line** (M8 Code view): annotate lines of a compiled file or an agent's change
+  and send the notes to the agent in one message.
+- **Coordinator and workers** (M10): one agent splits work into Hermes kanban tasks for the others
+  and reviews them (Hermes delegation and kanban already run this; the board should draw it).
+- **Parallel copies** (M10): run the same agent on N variants of a task in separate workspaces and
+  compare the results side by side.
+- **Chat ↔ terminal hand-off** (M8): open an agent's run in the Terminal pane and back.
+- **Phone notifications with reply** (M14) and **split panes** (M15).
+Not taken: git commit and PR drafting (git beyond status and diffs is out of scope), its look.
+
+## Launch checklist
+
+| | Item | Who |
+|---|---|---|
+| ○ | v0.2.0 installers, installed on a real Mac and PC | owner tests, Claude fixes |
+| ○ | A real model end to end (Ollama, one cloud model) | owner's key, through a secure form |
+| ○ | Approval cards: answer Hermes' "may I?" from McBot | Claude |
+| ○ | Always on: background engine, launch at login | Claude |
+| ◐ | Budgets per agent: daily limit and alerts in Cost and Home ●; stopping runs at the limit ○ | Claude |
+| ○ | Auto-update (signed update manifest) | owner makes the key, Claude wires it |
+| ○ | Windows: SignPath Foundation signing in release.yml; Microsoft Store listing | owner applies and registers, Claude wires it |
+| ○ | Linux: Flathub | Claude prepares, owner submits |
+| ○ | Phones: installable web app for chat and approvals | Claude |
+| ○ | Your own ChatGPT / Claude plan (decision 1) | Claude |
+| ○ | Ask McBot | Claude |
+| ○ | Google and Slack sign-in | Claude |
+| ○ | Docs, changelog, website on the domain, fresh screenshots, a short video | Claude, owner records the video |
+| ○ | Licences and notices check | Claude |
+
+## Design
+
+Each new surface is designed in the app itself and reviewed in the browser
+demo, where changes are visible in minutes: Home, the Tasks view, the
+workbench panes (terminal, editor, browser), the app catalog, workflow nodes,
+teams and roles, settings and the menu bar.
+
+## Catch-up plan vs nightly OpenBot (2026-11-17)
+
+Features only; their code is PolyForm Noncommercial and never comes in (hard rule 1). Done so far:
+starter cards in New agent, the floating island window, OpenCode Zen preset.
+
+### A. Browser the agent and the person share (the biggest gap) — M8
+Today the Browser view is a page to look at plus "Ask an agent"; the agent browses somewhere else
+(Hermes' own Chromium) and the person never sees it. OpenBot has one in-app browser the agent drives
+while you watch, and you can take over.
+1. **Tabs, history, bookmarks, find-in-page** in `BrowserView` (pure UI; native child webview per tab, one visible).
+2. **Watch**: the agent's browser shown live in the pane. Hermes takes a CDP endpoint
+   (`browser.cdp_url` / `BROWSER_CDP_URL`, `hermes/tools/browser_session_cdp.py`): McBot starts one
+   Chromium with a debugging port, writes that URL into the agent's config, streams its screencast
+   (CDP `Page.startScreencast`) into the pane, and clicks/typing in the pane go back over CDP.
+   Verify the config key in `hermes_cli/config.py` before compiling it (rule 2).
+3. **Take over / hand back**: a banner "Mapped is browsing — Take over"; while taken, the agent pauses.
+4. **Logins that persist**: a McBot browser profile (cookies kept), so the agent can use sites the
+   person signed in to; Hermes has `browser_session_real_profile.py` and a vault: check before building.
+5. **Point at the page** (Orca idea, already planned): click an element, send selector + HTML to chat.
+Windows' WebView2 can expose CDP itself; macOS WKWebView cannot, so Chromium + screencast is the common path.
+
+### B. Providers (Settings → Providers)
+Connected / Other list with status, one-click setup, "update required", and per row which agents use it
+and what it costs. Includes keyless free start **if** opencode.ai/zen answers without a key (unverified:
+`curl https://opencode.ai/zen/v1/models`).
+
+### C. Onboarding
+First launch → pick a model (free if verified, local if found, else key) → New agent with starter cards → first chat.
+Cut today's setup assistant to that path; the questions move into the agent's first message.
+
+### D. Mac feel and smoothness
+Window vibrancy on macOS (Tauri effects), springs on every sheet and toast (tokens exist), sidebar and
+rail selection slide, a "…" overflow menu in the rail with pinning, a dismissible product card, bouncy toasts.
+Test on a real Mac and Windows; screenshots at @2x for the site.
+
+### E. Chat details they have
+Context meter with compaction warning, branch a conversation from a message, agent-to-agent messages and
+file transfer, per-agent queue (done), search across conversations (done).
+
+### F. Not copying
+Account sign-in, WebRTC remote mode, mobile app: they conflict with "no auth, no cloud" until asked.
+
+Order: A1–A3 → B → C → D → A4–A5 → E.
+
+### Ideas from Raycast and vorssaint-utils (2026-11-17; features only)
+Raycast's app is closed; its repos `extensions`, `script-commands`, `ray-so` are MIT (ray-so's AI prompt
+library could seed starter prompts, with its LICENSE kept). vorssaint-utils is **GPL-3.0**: never copy, rebuild.
+Done: ranked palette with recents, Ask fallback, actions panel (⌘K on a row).
+Next, in order: **Quicklinks** (a name opens a URL or folder, or sends a prompt to an agent, with `{argument}`);
+**Snippets** (expand text by keyword; an agent can use them); **Clipboard history** as a source the person
+may hand an agent ("use what I copied"); **aliases and hotkeys per command**; **scratchpad** note in the
+island; **window-level launcher** (the floating island can host ⌘⇧Space's palette so it opens over any app);
+**script commands** (shell scripts with a header, as tools for agents).
+

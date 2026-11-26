@@ -1,0 +1,37 @@
+# McBot's changes to Hermes Agent
+
+This directory is [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+(MIT, © Nous Research; see `LICENSE`) at the upstream commit in
+`UPSTREAM.json`, plus the changes below. Each one is marked `McBot:` in the
+code and kept as a patch file in `patches/hermes/` (one per file, against that
+commit). Keep them few and small, so that `npm run engine:sync -- <checkout>`
+can three-way merge every upstream release into them.
+
+- `npm run engine:patches -- check` (also part of `npm test`) fails if any patch
+  is no longer applied here, so an edit or a sync cannot drop one silently.
+- After changing a file here, rewrite the patches with
+  `npm run engine:patches -- make <hermes-agent checkout at UPSTREAM.json's commit>`.
+- `npm run engine:sync` rewrites them against the new upstream and stops if a
+  file that had a patch no longer differs from upstream.
+- `.github/workflows/hermes-upstream.yml` opens an issue when upstream changes a
+  file we patch.
+- `.github/workflows/hermes-sync.yml` merges upstream's newest stable release every
+  Monday and opens a PR with the test results.
+
+| File | Change | Why |
+|---|---|---|
+| `gateway/session_policy.py` | `mcbot` is a session surface (runs as the CLI) and keeps its own stored label | Runs McBot starts are recorded as McBot's (`--source mcbot`) |
+| `tui_gateway/contracts/canonical_sessions.py` | `mcbot` is an accepted `session.create` source | Same |
+| `persistence/conversation/sessions.py` | `mcbot` sessions stay out of human session pickers (`INTERNAL_LISTING_SOURCES`) | Same treatment as `oneshot` runs |
+| `tui_gateway/methods_projects.py` | `mcbot` sessions stay out of project trees | Same |
+| `persistence/authority/coordination.py` | `mcbot` sessions may dispatch delegated work (`DELEGATION_ORIGIN_SOURCES`) | Same as `oneshot` |
+| `agent/managed_worker.py` | `mcbot` is a CLI-surface label | Same as `tool` and `oneshot` |
+| `agent/prompt_caching.py` | `mcbot` runs are machine-paced (short cache) | Same as `oneshot` |
+| `hermes_cli/config.py` | With `HERMES_MANAGED=mcbot`, refusals say Hermes is part of McBot | `npm run cli -- update` explains that updates arrive with McBot |
+| `plugins/platforms/telegram/adapter.py` | With an own Bot API server (`extra.base_url`), Telegram's fallback IPs are not used | The fallback transport sends any host but `api.telegram.org` down a direct path whose proxy was resolved for `api.telegram.org`, so a local Bot API server went through the system proxy and failed. (Since v0.23.1 upstream checks `NO_PROXY` against the own server itself, `proxy_target_hosts`, so that half of our change is gone.) |
+| `gateway/platforms/api_server_runs.py` | The runs API's `tool.completed` carries the tool's result preview on the admitted-turn path | The other path already does (`_tool_completed_preview`); without it every tool's output reached McBot empty, so made images and failed-tool text were lost |
+| `hermes_cli/kanban.py` | `kanban complete --force` from outside any worker (no `HERMES_KANBAN_TASK`) skips the goal judge | A person's "Mark done" / "Approve" in McBot is a human override, as the dashboard's "done" (`complete_task(force=True)`, no judge). Without it a person could not close a goal-mode card: the judge rejects a verdict with no evidence ("empty response") |
+
+Not changed on purpose: home initialisation. McBot's runs do not set
+`HERMES_MANAGED`, because a managed install stops creating and securing its
+home's folders (`hermes_cli/config_home.py`, `initialize_home`).

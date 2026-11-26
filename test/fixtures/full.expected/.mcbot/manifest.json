@@ -1,0 +1,50 @@
+{
+  "schema": "mcbot.compile/v1",
+  "graphId": "acme-ops",
+  "profiles": [
+    "researcher",
+    "writer"
+  ],
+  "files": [
+    {
+      "path": "profiles/researcher/SOUL.md",
+      "sha256": "7afe7ceaaeb296c20e091eff24bcde51cba8ce63520b2ad2a85b88c4afd81b26",
+      "bytes": 778
+    },
+    {
+      "path": "profiles/researcher/config.yaml",
+      "sha256": "eab17412280f0ce82251c8498a723650832ad3127e72eff31ba017f972743772",
+      "bytes": 1552
+    },
+    {
+      "path": "profiles/researcher/profile.yaml",
+      "sha256": "f4cec9d138cab95c55c30b9c3f23b605a0019bfc3178ff72ef514e12b9e0732a",
+      "bytes": 25
+    },
+    {
+      "path": "profiles/researcher/skills/mcbot/mcbot-studio/SKILL.md",
+      "sha256": "db8175c14a18206a99e7ef5b19a1ed216d74d41dc2aacb5d511913fc986a4bea",
+      "bytes": 7221
+    },
+    {
+      "path": "profiles/researcher/skills/on-call/SKILL.md",
+      "sha256": "b80c81f31f9a8003ddd0c549e3dc3e50b2449005886e8ebffa92f93d15463c2f",
+      "bytes": 110
+    },
+    {
+      "path": "profiles/researcher/skills/web-brief/SKILL.md",
+      "sha256": "a8017187f6e3f1f498ef5047cbbfbf0b768e358b1a8eed6d537e07af0dc04a60",
+      "bytes": 283
+    },
+    {
+      "path": "profiles/writer/SOUL.md",
+      "sha256": "d757a76d3323a35f80b40ae4940ef3c68bf64fe52e47ee35992fc25809a92c03",
+      "bytes": 336
+    },
+    {
+      "path": "profiles/writer/config.yaml",
+      "sha256": "ef5426af202edcb824456626fcf1c7da392122530edb140c70ffe0733fdf5621",
+      "bytes": 727
+    }
+  ]
+}

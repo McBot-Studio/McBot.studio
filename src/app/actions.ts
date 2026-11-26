@@ -1,0 +1,219 @@
+import { exportText, nameFromFile } from "../board/files";
+import { engine, EngineError } from "./lib/engine";
+import { canReveal, revealFile } from "./lib/open";
+import { useApp } from "./state/store";
+
+type Compiled = Awaited<ReturnType<typeof engine.compile>>;
+const changedCount = (r: Compiled) => (r.ok ? r.report.changes.filter((c) => c.status !== "unchanged").length : 0);
+
+/** Which agents have files on disk, and whether they match the board (see `onDisk` in the store). */
+export function diskState(r: Compiled): Record<string, "fresh" | "stale"> | null {
+  if (!r.ok) return null;
+  const out: Record<string, "fresh" | "stale"> = {};
+  for (const p of r.report.profiles) {
+    const mine = r.report.changes.filter((c) => c.path.startsWith(`${p.dir}/`) && c.status !== "removed");
+    if (mine.length === 0 || mine.every((c) => c.status === "added")) continue;
+    out[p.name] = mine.every((c) => c.status === "unchanged") ? "fresh" : "stale";
+  }
+  return out;
+}
+
+export async function compileBoard(boardId: string, opts: { quiet?: boolean } = {}): Promise<boolean> {
+  const app = useApp.getState();
+  app.setCompile({ compileBusy: true });
+  try {
+    const res = await engine.compile(boardId);
+    // The compile sheet (files and diffs) opens only when asked for; a compile says how it went in
+    // a notice, and a board with problems points at the first block to fix.
+    app.setCompile({ compile: res, compileOpen: false, drift: res.ok ? 0 : null, ...(res.ok ? { onDisk: Object.fromEntries(res.report.profiles.map((p) => [p.name, "fresh" as const])) } : {}) });
+    const showFiles = { label: "Files", run: () => { const a = useApp.getState(); a.setTab("graph"); a.setCompile({ compileOpen: true }); } };
+    if (res.ok) {
+      const n = changedCount(res);
+      if (!opts.quiet) app.toast({ kind: "ok", text: n ? `Compiled · ${n} file${n === 1 ? "" : "s"} updated` : "Compiled · already up to date", action: showFiles });
+    } else {
+      const errors = res.issues.filter((i) => i.level === "error");
+      const first = errors.find((i) => i.nodeId);
+      app.toast({
+        kind: "fail",
+        text: errors.length ? `${errors.length} thing${errors.length === 1 ? "" : "s"} to fix first: ${errors[0]!.message}` : res.error,
+        action: first ? { label: "Fix", run: () => { const a = useApp.getState(); a.setTab("graph"); a.select(first.nodeId!); } } : undefined,
+      });
+    }
+    return res.ok;
+  } catch (err) {
+    app.toast({ kind: "fail", text: (err as Error).message });
+    return false;
+  } finally {
+    app.setCompile({ compileBusy: false });
+  }
+}
+
+/** Dry-run compile: how many files on disk differ from the board right now. */
+export async function refreshDrift(boardId: string): Promise<void> {
+  try {
+    const res = await engine.preview(boardId);
+    useApp.getState().setCompile({ drift: res.ok ? changedCount(res) : null, onDisk: diskState(res) });
+  } catch {
+    useApp.getState().setCompile({ drift: null, onDisk: null });
+  }
+}
+
+export async function runAgent(boardId: string, agentNodeId: string, prompt: string, retried = false): Promise<string | null> {
+  const app = useApp.getState();
+  // Until the run's first event arrives, the agent counts as busy (the chat's queue waits for it).
+  app.setStarting(agentNodeId, true);
+  try {
+    const { runId } = await engine.startRun(boardId, agentNodeId, prompt);
+    app.selectRun(runId);
+    setTimeout(() => useApp.getState().setStarting(agentNodeId, false), 800);
+    return runId;
+  } catch (err) {
+    app.setStarting(agentNodeId, false);
+    if (err instanceof EngineError && err.status === 409 && err.body.stale && !retried) {
+      // The board changed since the last compile: write the agents' files, then send. A message should
+      // just go, as in any chat app; only a compile that fails stops it (and says why, with "Fix").
+      app.setStarting(agentNodeId, true);
+      const ok = await compileBoard(boardId, { quiet: true });
+      app.setStarting(agentNodeId, false);
+      return ok ? runAgent(boardId, agentNodeId, prompt, true) : null;
+    }
+    if (err instanceof EngineError && err.status === 409 && err.body.stale) {
+      app.toast({
+        kind: "fail",
+        text: err.message,
+        action: { label: "Compile & run", run: () => void compileBoard(boardId, { quiet: true }).then((ok) => (ok ? runAgent(boardId, agentNodeId, prompt) : null)) },
+      });
+    } else {
+      app.toast({ kind: "fail", text: (err as Error).message });
+    }
+    return null;
+  }
+}
+
+/** Save the board as a file: into the McBot folder's exports/ (desktop), or a download (browser demo). */
+export async function exportBoardFile(boardId: string): Promise<void> {
+  const app = useApp.getState();
+  try {
+    const res = await engine.exportBoard(boardId);
+    if (res.path) {
+      const path = res.path;
+      app.toast({ kind: "ok", text: `Exported to ${res.shown ?? path}`, action: canReveal() ? { label: "Show", run: () => void revealFile(path) } : undefined });
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([exportText(res.graph)], { type: "application/json" }));
+    const a = Object.assign(document.createElement("a"), { href: url, download: res.file });
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    app.toast({ kind: "ok", text: `Downloaded ${res.file}` });
+  } catch (err) {
+    app.toast({ kind: "fail", text: (err as Error).message });
+  }
+}
+
+/** Draw this computer's Hermes setup (~/.hermes) as a new board. */
+export async function openHermesSetup(): Promise<void> {
+  const app = useApp.getState();
+  try {
+    const b = await engine.openHermes();
+    app.setBoards(await engine.boards());
+    app.setBoard(b.id);
+    app.setTab("graph");
+    const more = b.unshown.length ? ` · ${b.unshown.length} not shown yet (see the gray note)` : "";
+    app.toast({ kind: "ok", text: `Opened your Hermes setup${more}` });
+  } catch (err) {
+    app.toast({ kind: "fail", text: (err as Error).message });
+  }
+}
+
+/** Pick a board file and open it as a new board. Nothing existing is replaced. */
+export function importBoardFile(): void {
+  const input = Object.assign(document.createElement("input"), { type: "file", accept: ".json,application/json" });
+  input.onchange = async () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    const app = useApp.getState();
+    try {
+      let graph: unknown;
+      try {
+        graph = JSON.parse(await file.text());
+      } catch {
+        throw new Error("This file isn't a McBot board.");
+      }
+      const b = await engine.importBoard(graph, nameFromFile(file.name));
+      app.setBoards(await engine.boards());
+      app.setBoard(b.id);
+      app.setTab("graph");
+      app.toast({ kind: "ok", text: `Imported “${b.name}”` });
+    } catch (err) {
+      app.toast({ kind: "fail", text: (err as Error).message });
+    }
+  };
+  input.click();
+}
+
+/** Stop a run (every Stop button): McBot ends it within a few seconds even if Hermes is mid-step. */
+export async function stopRun(runId: string): Promise<void> {
+  const app = useApp.getState();
+  try {
+    // Stop means stop: messages waiting for this agent don't start by themselves afterwards.
+    const agent = app.runs[runId]?.agentNodeId;
+    const waiting = agent ? app.queue[agent]?.items.length ?? 0 : 0;
+    if (agent && waiting) useApp.setState((s) => ({ queue: { ...s.queue, [agent]: { items: [], paused: false } } }));
+    const { cancelled } = await engine.cancelRun(runId);
+    const cleared = waiting ? ` ${waiting} waiting message${waiting > 1 ? "s" : ""} cleared.` : "";
+    app.toast({ kind: "info", text: cancelled ? `Stopping…${cleared}` : `It had already finished.${cleared}` });
+  } catch (e) {
+    app.toast({ kind: "fail", text: (e as Error).message });
+  }
+}
+
+/** "official/research/rss-feeds" → "rss-feeds". */
+export const skillName = (id: string) => id.split("/").pop() ?? id;
+
+/** Install Hermes library skills into an agent, one by one, then say so (unless `quiet`). */
+export async function learnSkills(profile: string, who: string, ids: readonly string[], quiet = false): Promise<{ done: string[]; failed: string[] }> {
+  const done: string[] = [];
+  const failed: string[] = [];
+  for (const id of ids) {
+    try {
+      await engine.installSkill(profile, id);
+      done.push(skillName(id));
+    } catch {
+      failed.push(skillName(id));
+    }
+  }
+  if (quiet) return { done, failed };
+  const app = useApp.getState();
+  if (done.length) app.toast({ kind: "ok", text: `${who} learned ${done.length} Hermes skill${done.length === 1 ? "" : "s"}: ${done.join(", ")}`, action: { label: "Skills", run: () => useApp.getState().setTab("skills") } });
+  if (failed.length) app.toast({ kind: "fail", text: `${who} couldn't add ${failed.join(", ")}`, action: { label: "Skills", run: () => useApp.getState().setTab("skills") } });
+  return { done, failed };
+}
+
+/** Several agents' Hermes skills, one after another in the background, with one notice for all. */
+export async function learnTeamSkills(label: string, skills: readonly { profile: string; who: string; ids: readonly string[] }[]): Promise<void> {
+  let done = 0;
+  const failed: string[] = [];
+  for (const s of skills) {
+    const r = await learnSkills(s.profile, s.who, s.ids, true);
+    done += r.done.length;
+    failed.push(...r.failed.map((f) => `${s.who}: ${f}`));
+  }
+  const skillsTab = { label: "Skills", run: () => useApp.getState().setTab("skills") };
+  if (done) useApp.getState().toast({ kind: "ok", text: `${label} learned ${done} Hermes skill${done === 1 ? "" : "s"}`, action: skillsTab });
+  if (failed.length) useApp.getState().toast({ kind: "fail", text: `Couldn't add ${failed.join(", ")}`, action: skillsTab });
+}
+
+/** Thumbs up (1) or down (0) on an answer, or take it back (null): shown at once, saved by the engine (Learn). */
+export async function rateRun(runId: string, score: 0 | 1 | null): Promise<void> {
+  const app = useApp.getState();
+  const before = app.ratings[runId] ?? null;
+  app.setRating(runId, score === null ? null : { score, at: Date.now() });
+  try {
+    const { rating } = await engine.rate(runId, score);
+    useApp.getState().setRating(runId, rating);
+  } catch (err) {
+    useApp.getState().setRating(runId, before);
+    app.toast({ kind: "fail", text: (err as Error).message });
+  }
+}
+
