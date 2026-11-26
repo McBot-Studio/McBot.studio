@@ -136,7 +136,7 @@ jobs:
       # attestation shows up in `gh attestation verify`, a missing installer would not.
       - name: Build provenance
         continue-on-error: true
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             src-tauri/target/*/release/bundle/dmg/*.dmg
