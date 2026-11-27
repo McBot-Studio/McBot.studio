@@ -98,7 +98,7 @@ const uid = () => Math.random().toString(36).slice(2, 10);
  * to `model` (or one new model), their tools and chat apps beside them, and the hand-offs. Profile
  * names are made unique; the skills come back to install once the agents are compiled.
  */
-export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | null, newModel: (pos: { x: number; y: number }) => GraphNode): { nodes: GraphNode[]; edges: GraphEdge[]; lead: string; skills: { profile: string; who: string; ids: readonly string[] }[] } {
+export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | null, newModel: (pos: { x: number; y: number }) => GraphNode): { nodes: GraphNode[]; edges: GraphEdge[]; lead: string; skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] } {
   const p = restrictPlan(plan, PLAN_CHOICES);
   const taken = new Set(graph.nodes.filter((n) => n.kind === "agent").map((n) => String(n.data.name)));
   const toolNames = new Set(graph.nodes.filter((n) => n.kind === "tool").map((n) => String(n.data.name)));
@@ -109,7 +109,7 @@ export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | 
   const modelNode = model ?? newModel({ x: left, y: top + 120 });
   if (!model) nodes.push(modelNode);
   const ids = new Map<string, string>();
-  const skills: { profile: string; who: string; ids: readonly string[] }[] = [];
+  const skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] = [];
   const workGraph: Graph = { ...graph, nodes: [...graph.nodes] };
   /** One block per tool, shared by every agent in the plan that uses it. */
   const toolBlocks = new Map<string, string>();
@@ -129,7 +129,7 @@ export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | 
     shown.push(displayName);
     nodes.push({ id, kind: "agent", position, data: { name: profile, displayName, description: a.about, soul: withRichAnswers(a.soul), skills: [], capabilities: null, ...(a.maxSteps ? { maxSteps: a.maxSteps } : {}) } });
     edges.push({ id: `edge-${uid()}`, source: modelNode.id, target: id, order: 0 });
-    if (a.skills.length) skills.push({ profile, who: a.name, ids: a.skills });
+    if (a.skills.length) skills.push({ profile, who: a.name, ids: a.skills, nodeId: id });
     a.tools.forEach((t, k) => {
       let block = toolBlocks.get(t);
       if (!block) {

@@ -53,7 +53,7 @@ uniqueness, reserved names, cloud models need a key env var) are in
 
 ```
 <root>/                               a Hermes home: agents run as HERMES_HOME=<root> hermes -p <agent>
-  .mcbot/manifest.json                every file McBot owns, with sha256 and size
+  .mcbot/manifest.json                every file McBot owns, with sha256 and size, per board
   profiles/<agent>/
     SOUL.md  config.yaml  profile.yaml  [.no-bundled-skills: only when built-in skills are off]
     skills/<skill>/SKILL.md
@@ -61,10 +61,15 @@ uniqueness, reserved names, cloud models need a key env var) are in
 ```
 
 UTF-8, LF, one trailing newline, YAML 1.1. The same graph always yields the
-same bytes. Ownership: the writer (`engine/writer.ts`) deletes only files its
-previous manifest lists and refuses to write into a profile dir it did not
-create. Each compile reports `added | modified | unchanged | removed` per file,
-with a unified diff. The key-by-key mapping is in `docs/HERMES.md`.
+same bytes. Ownership: every board compiles into the same root, and the writer
+(`engine/writer.ts`, `src/harness/ledger.ts`) keeps each board's part in the
+manifest. A compile deletes only files its own board wrote before, never another
+board's; a profile dir belongs to one board at a time, and an agent whose id
+another board's agent (or a dir McBot did not create) already has gets a free one
+first ("writer-2"); it never writes into a dir it did not create. A removed
+agent's dir stays McBot's (`retired`), so the id can come back to it. Each compile
+reports `added | modified | unchanged | removed` per file, with a unified diff.
+The key-by-key mapping is in `docs/HERMES.md`.
 
 **2.2.3 Run event shape** — `src/contracts/run.ts`, `v: 1`
 

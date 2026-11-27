@@ -148,7 +148,7 @@ const TOOLS = [...CATALOG, ...CONNECTOR_TOOLS];
  * The nodes and edges that add `team` to `graph`: below what is there, ids unique, each agent wired
  * to `model` (or a new local model when the board has none).
  */
-export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | null, newModel: (pos: { x: number; y: number }) => GraphNode): { nodes: GraphNode[]; edges: GraphEdge[]; lead: string; skills: { profile: string; who: string; ids: readonly string[] }[] } {
+export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | null, newModel: (pos: { x: number; y: number }) => GraphNode): { nodes: GraphNode[]; edges: GraphEdge[]; lead: string; skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] } {
   const taken = new Set(graph.nodes.filter((n) => n.kind === "agent").map((n) => String(n.data.name)));
   const top = Math.max(0, ...graph.nodes.map((n) => n.position.y + 200));
   const left = Math.min(0, ...graph.nodes.map((n) => n.position.x));
@@ -157,14 +157,14 @@ export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | nu
   const modelNode = model ?? newModel({ x: left, y: top + 120 });
   if (!model) nodes.push(modelNode);
   const ids = new Map<string, string>();
-  const skills: { profile: string; who: string; ids: readonly string[] }[] = [];
+  const skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] = [];
   const shown: string[] = [];
   team.members.forEach((m, i) => {
     let name = m.name;
     for (let n = 2; taken.has(name) || RESERVED_PROFILE_NAMES.includes(name); n++) name = `${m.name}-${n}`;
     taken.add(name);
-    if (m.skills?.length) skills.push({ profile: name, who: m.displayName, ids: m.skills });
     const id = `agent-${uid()}`;
+    if (m.skills?.length) skills.push({ profile: name, who: m.displayName, ids: m.skills, nodeId: id });
     ids.set(m.name, id);
     // The lead on top, its team in a row below: hand-offs read top to bottom.
     const position = i === 0 ? { x: left + 340 + ((team.members.length - 2) * 260) / 2, y: top } : { x: left + 340 + (i - 1) * 260, y: top + 240 };

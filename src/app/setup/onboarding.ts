@@ -116,14 +116,14 @@ export function buildSetupBoard(opts: {
   workspace: string;
   /** The image/video service: one of Hermes' maker services, or "huggingface" (its connector instead of a maker). */
   maker?: string | null;
-}): { graph: Graph; lead: string | null; skills: { profile: string; who: string; ids: readonly string[] }[] } {
+}): { graph: Graph; lead: string | null; skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] } {
   const graph: Graph = { schema: GRAPH_SCHEMA, id: "setup", name: boardName(opts.profile), nodes: [], edges: [] };
   const models: ModelNode[] = opts.models.map((m, i) => ({
     id: `model-${m.endpoint}`, kind: "model", position: { x: -420, y: i * 200 },
     data: { name: m.endpoint, label: m.label, endpoint: m.endpoint, baseUrl: m.baseUrl, model: m.model, apiKeyEnv: m.endpoint === "cloud" ? m.apiKeyEnv : "", pricing: null },
   }));
   graph.nodes.push(...models);
-  const skills: { profile: string; who: string; ids: readonly string[] }[] = [];
+  const skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] = [];
   let lead: string | null = null;
   // With no model yet the agents still go on the board; a local model block waits to be set.
   const newModel = (position: { x: number; y: number }): GraphNode => ({

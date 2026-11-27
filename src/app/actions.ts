@@ -170,13 +170,23 @@ export async function stopRun(runId: string): Promise<void> {
 /** "official/research/rss-feeds" → "rss-feeds". */
 export const skillName = (id: string) => id.split("/").pop() ?? id;
 
+/**
+ * The id an agent compiled as in the last compile: a compile may give it a free one first, when
+ * another board's agent has its id (src/harness/ledger.ts).
+ */
+export function compiledAs(nodeId: string | undefined): string | null {
+  const c = useApp.getState().compile;
+  return nodeId && c?.ok ? c.report.profiles.find((p) => p.nodeId === nodeId)?.name ?? null : null;
+}
+
 /** Install Hermes library skills into an agent, one by one, then say so (unless `quiet`). */
-export async function learnSkills(profile: string, who: string, ids: readonly string[], quiet = false): Promise<{ done: string[]; failed: string[] }> {
+export async function learnSkills(profile: string, who: string, ids: readonly string[], quiet = false, nodeId?: string): Promise<{ done: string[]; failed: string[] }> {
   const done: string[] = [];
   const failed: string[] = [];
+  const as = compiledAs(nodeId) ?? profile;
   for (const id of ids) {
     try {
-      await engine.installSkill(profile, id);
+      await engine.installSkill(as, id);
       done.push(skillName(id));
     } catch {
       failed.push(skillName(id));
@@ -190,11 +200,11 @@ export async function learnSkills(profile: string, who: string, ids: readonly st
 }
 
 /** Several agents' Hermes skills, one after another in the background, with one notice for all. */
-export async function learnTeamSkills(label: string, skills: readonly { profile: string; who: string; ids: readonly string[] }[]): Promise<void> {
+export async function learnTeamSkills(label: string, skills: readonly { profile: string; who: string; ids: readonly string[]; nodeId?: string }[]): Promise<void> {
   let done = 0;
   const failed: string[] = [];
   for (const s of skills) {
-    const r = await learnSkills(s.profile, s.who, s.ids, true);
+    const r = await learnSkills(s.profile, s.who, s.ids, true, s.nodeId);
     done += r.done.length;
     failed.push(...r.failed.map((f) => `${s.who}: ${f}`));
   }

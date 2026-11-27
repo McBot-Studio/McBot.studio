@@ -83,6 +83,15 @@ Change them additively; a breaking change bumps the version.
   nothing else, and refuses to write into a profile dir it did not create. Inside
   config.yaml it owns only the keys in `OWNED` (`src/harness/merge.ts`); when compile
   writes a new key, add it there too (a test fails otherwise).
+- **Many boards, one root** (`src/harness/ledger.ts`, pure; the writer and the demo plan with it): the manifest on
+  disk keeps each board's agents and files (`boards`; `profiles`/`files` are every board's, `graphId` the last
+  compiled). A compile removes only its own board's earlier files. A profile dir is one board's at a time: an agent
+  whose id another board's live agent, or a dir McBot did not make, already has gets a free id before it compiles
+  (`claimNames`, "writer-2": the board is edited on a real compile, a dry run only shows it); a board that no longer
+  has the agent gives the dir up. A removed agent's dir stays McBot's (`retired`), so the id can come back to it with
+  Hermes' memory. A manifest from before (one board) is read with `hermes-seen.json`'s names as McBot's. Board-scoped
+  routes (team, memory, cost, Files, runs) use `profilesOf` / `ownerOf`, never the union; a run checks its agent's
+  dir is this board's.
   Hermes writes `state.db`, `sessions/`, `memories/`, logs and seeded skills into
   the same dirs.
 

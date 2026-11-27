@@ -19,7 +19,9 @@ import type { HarnessPlan, PlanChoices } from "../../harness/plan";
 import type { CatalogPlugin, InstalledPlugin, LibrarySkill, ProfileSkill, SkillSearchResult, SkillsView, AgentMemoryView, BoardExport, BoardInfo, CompileResponse, CostReport, Diagnostics, FsBrowse, FsEntry, FsListing, FsPreview, FsRoot, Health, HermesInfo, MemoryFileView, AgentSchedules, ScheduleView, SetupDetect, SetupProfile, SetupState, SharingView, GuestView, GitHubRepoView, LoginView, SignInView, TaskAction, UpdateView, TaskDetail, TasksView, TaskView, LearnExport, LearnView, DocUpload, TrainJob } from "../../contracts/api";
 import upstream from "../../../hermes/UPSTREAM.json";
 import { version as APP_VERSION } from "../../../package.json";
-import { MANIFEST_PATH, type FileChange, type Manifest } from "../../contracts/compile";
+import { MANIFEST_PATH, type CompiledFile, type FileChange, type Manifest } from "../../contracts/compile";
+import { claimNames, ownerOf, planWrite, profilesOf, toLedger, type Ledger } from "../../harness/ledger";
+import { renderManifest } from "../../compile/manifest";
 import { DOC_TEXT_MAX, GRAPH_SCHEMA, type Graph } from "../../contracts/graph";
 import { applyToDoc, agentEditable, normal, safeName, SECRET_FILES } from "../../harness/live";
 import { shownAs } from "../files/paths";
@@ -237,28 +239,67 @@ function unifiedDiff(path: string, before: string, after: string): string {
   return before === after ? "" : createTwoFilesPatch(`a/${path}`, `b/${path}`, before, after, "", "", { context: 3 });
 }
 
-function manifest(): Manifest | null {
+/** Every board's agents in the demo's root, as the engine's writer keeps them (src/harness/ledger.ts). */
+function manifest(): Ledger | null {
   const raw = state.disk[MANIFEST_PATH];
   if (!raw) return null;
   try {
-    return JSON.parse(raw) as Manifest;
+    return toLedger(JSON.parse(raw) as Manifest);
   } catch {
     return null;
   }
 }
 
+const agentsOn = (g: Graph) => g.nodes.filter((n) => n.kind === "agent").map((n) => ({ id: n.id, name: String((n.data as { name?: unknown }).name ?? "") }));
+const boardHas = (board: string, profile: string) => state.boards.some((b) => b.id === board) && agentsOn(graphOf(board)).some((a) => a.name === profile);
+/** Profile folders on the demo's disk that have something in them. */
+const occupied = () => new Set(Object.keys(state.disk).map((p) => /^profiles\/([^/]+)\//.exec(p)?.[1]).filter((x): x is string => !!x));
+
+/** Board edits on a board that may not be open in this tab (kept as the tab would keep it). */
+function editBoard(boardId: string, edits: Parameters<typeof applyToDoc>[1]): void {
+  const open = docs.get(boardId);
+  if (open) return applyToDoc(open, edits);
+  const doc = new Y.Doc();
+  fillDoc(doc, boardId);
+  applyToDoc(doc, edits);
+  store.set(boardKey(boardId), toB64(Y.encodeStateAsUpdate(doc)));
+  doc.destroy();
+}
+
 function compileBoard(boardId: string, dryRun: boolean): CompileResponse {
-  const graph = graphOf(boardId);
+  let graph = graphOf(boardId);
   const { issues } = resolveGraph(graph);
   if (issues.some((i) => i.level === "error")) return { ok: false, issues, error: "The board has errors" };
+  // As the engine: every board compiles into one root, so an agent whose id another board's agent
+  // has gets a free one first (src/harness/ledger.ts).
+  const book = manifest() ?? toLedger(null);
+  const disk = occupied();
+  const taken = new Set([...book.profiles, ...book.retired, ...disk, ...state.boards.flatMap((b) => agentsOn(graphOf(b.id)).map((a) => a.name))]);
+  const foreign = new Set([...disk].filter((n) => !book.profiles.includes(n) && !book.retired.includes(n)));
+  const claims = claimNames({ agents: agentsOn(graph), boardId, ledger: book, live: boardHas, foreign, taken });
+  if (claims.length) {
+    const to = new Map(claims.map((c) => [c.id, c.to]));
+    if (dryRun) graph = { ...graph, nodes: graph.nodes.map((n) => (to.has(n.id) ? { ...n, data: { ...n.data, name: to.get(n.id)! } } : n)) } as Graph;
+    else {
+      editBoard(boardId, claims.map((c) => ({ op: "set" as const, id: c.id, field: "name", value: c.to })));
+      graph = graphOf(boardId);
+    }
+  }
   const compiled = compile(graph);
   // As the engine's writer: config.yaml is merged, so settings made outside the board stay.
-  const result = { ...compiled, files: compiled.files.map((f) => {
+  const files: CompiledFile[] = compiled.files.filter((f) => f.role !== "manifest").map((f) => {
     if (f.role !== "config") return f;
     const content = mergeConfig(state.disk[f.path] ?? null, f.content);
     return content === f.content ? f : { ...f, content, sha256: sha256Hex(content), bytes: utf8Bytes(content).length };
-  }) };
-  const next = new Set(result.files.map((f) => f.path));
+  });
+  const plan = planWrite({
+    ledger: book, graphId: compiled.graphId, profiles: compiled.profiles.map((p) => p.name),
+    files: files.map((f) => ({ path: f.path, sha256: f.sha256, bytes: f.bytes })), occupied: disk, live: boardHas,
+  });
+  if (plan.refusal) return { ok: false, issues, error: `profiles/${plan.refusal.profile} ${plan.refusal.kind === "taken" ? "is an agent on another board" : "was not made by McBot"}` };
+  const text = renderManifest(plan.ledger);
+  files.push({ path: MANIFEST_PATH, content: text, sha256: sha256Hex(text), bytes: utf8Bytes(text).length, role: "manifest" });
+  const result = { ...compiled, files };
   const changes: FileChange[] = result.files.map((f) => {
     const before = state.disk[f.path] ?? null;
     const prev = before === null ? null : sha256Hex(before);
@@ -267,10 +308,10 @@ function compileBoard(boardId: string, dryRun: boolean): CompileResponse {
       bytes: f.bytes, role: f.role, nodeId: f.nodeId ?? null, diff: unifiedDiff(f.path, before ?? "", f.content),
     };
   });
-  for (const old of manifest()?.files ?? []) {
-    const before = state.disk[old.path];
-    if (next.has(old.path) || before === undefined) continue;
-    changes.push({ path: old.path, status: "removed", sha256: null, previousSha256: sha256Hex(before), bytes: utf8Bytes(before).length, role: null, nodeId: null, diff: unifiedDiff(old.path, before, "") });
+  for (const path of plan.remove) {
+    const before = state.disk[path];
+    if (before === undefined) continue;
+    changes.push({ path, status: "removed", sha256: null, previousSha256: sha256Hex(before), bytes: utf8Bytes(before).length, role: null, nodeId: null, diff: unifiedDiff(path, before, "") });
   }
   changes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const configChanged = changes.some((c) => c.path.endsWith("/config.yaml") && c.status !== "unchanged");
@@ -663,7 +704,7 @@ function seedVersions(): void {
 const taskId = () => `t_${Math.random().toString(16).slice(2, 10).padEnd(8, "0")}`;
 
 function teamOf(boardId: string): Map<string, string> {
-  const compiled = manifest()?.profiles ?? [];
+  const compiled = profilesOf(manifest(), boardId);
   return new Map(bundlesOf(boardId).bundles.filter((b) => compiled.includes(b.agent.data.name)).map((b) => [b.agent.data.name, b.agent.id]));
 }
 
@@ -932,7 +973,7 @@ export const demoEngine = {
     return { cancelled: !!events && !done };
   }),
   memory: api((boardId: string): AgentMemoryView[] => {
-    const compiled = manifest()?.profiles ?? [];
+    const compiled = profilesOf(manifest(), boardId);
     return bundlesOf(requireBoard(boardId)).bundles.map(({ agent }) => ({
       profile: agent.data.name, nodeId: agent.id, displayName: agent.data.displayName || agent.data.name, compiled: compiled.includes(agent.data.name),
       busy: (busy.get(agent.data.name) ?? 0) > 0, memory: memoryView(agent.data.name, "memory"), user: memoryView(agent.data.name, "user"),
@@ -950,7 +991,7 @@ export const demoEngine = {
   }),
   cost: api((boardId: string): CostReport => {
     const { bundles } = bundlesOf(requireBoard(boardId));
-    const compiled = manifest()?.profiles ?? [];
+    const compiled = profilesOf(manifest(), boardId);
     const profiles = bundles.filter((b) => compiled.includes(b.agent.data.name)).map((b) => ({ profile: b.agent.data.name, agentNodeId: b.agent.id, sessions: state.sessions[b.agent.data.name] ?? [], dailyBudgetUsd: b.agent.data.dailyBudgetUsd ?? null }));
     const models = [...new Map(bundles.flatMap((b) => b.models).map((m) => [m.id, m])).values()];
     const runs = Object.values(state.runs).map((e) => summarizeRun(e)).filter((s): s is RunSummary => !!s && s.boardId === boardId);
@@ -1129,7 +1170,7 @@ export const demoEngine = {
     return schedulesOf(requireBoard(boardId), profile);
   }),
   roots: api((boardId: string): FsRoot[] => {
-    const compiled = manifest()?.profiles ?? [];
+    const compiled = profilesOf(manifest(), boardId);
     const profiles: FsRoot[] = bundlesOf(requireBoard(boardId)).bundles
       .filter((b) => compiled.includes(b.agent.data.name))
       .map((b) => ({ id: `profile:${b.agent.data.name}`, kind: "profile", name: b.agent.data.displayName || b.agent.data.name, path: `${ROOT}/profiles/${b.agent.data.name}`, nodeId: b.agent.id }));
@@ -1330,7 +1371,7 @@ function saveAgentFile(profile: string, path: string, text: string, baseSha256: 
   };
   const base = files();
   state.disk[full] = text;
-  const boardId = manifest()?.graphId ?? "";
+  const boardId = ownerOf(manifest(), profile) ?? "";
   let followed: string[] = [];
   const doc = docs.get(boardId);
   if (doc) {

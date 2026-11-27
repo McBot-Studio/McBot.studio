@@ -94,7 +94,7 @@ export function NewAgentSheet() {
     // Ready to talk to straight away when the board compiles; otherwise the graph shows what is missing.
     if (await compileBoard(boardId, { quiet: true })) {
       app.editAgent(agent.id);
-      if (skills.length && !REMOTE) void learnSkills(id, name.trim(), skills);
+      if (skills.length && !REMOTE) void learnSkills(id, name.trim(), skills, false, agent.id);
     } else app.setTab("graph");
   };
 

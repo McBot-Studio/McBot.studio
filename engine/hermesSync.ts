@@ -77,26 +77,34 @@ export class HermesSync {
     return change;
   }
 
-  /** One look at every compiled agent's files; follows the ones that changed. */
+  /** Every agent McBot has compiled into this root and followed (the manifest's record from before boards were kept apart). */
+  async known(): Promise<string[]> {
+    return Object.keys(await this.load());
+  }
+
+  /** One look at every compiled agent's files, on every board; follows the ones that changed. */
   async tick(): Promise<HarnessChange[]> {
     if (this.busy) return [];
     this.busy = true;
     try {
       const manifest = await readManifest(this.root).catch(() => null);
-      if (!manifest || !(await this.relay.exists(manifest.graphId))) return [];
+      if (!manifest) return [];
       const seen = await this.load();
       const out: HarnessChange[] = [];
-      for (const name of manifest.profiles) {
-        const now = await this.read(name);
-        if (!seen[name]) {
-          // First look (before any compile McBot remembers): this is the starting point.
-          seen[name] = now;
-          await this.save();
-          continue;
+      for (const [boardId, board] of Object.entries(manifest.boards)) {
+        if (!(await this.relay.exists(boardId))) continue;
+        for (const name of board.profiles) {
+          const now = await this.read(name);
+          if (!seen[name]) {
+            // First look (before any compile McBot remembers): this is the starting point.
+            seen[name] = now;
+            await this.save();
+            continue;
+          }
+          if (JSON.stringify(now) === JSON.stringify(seen[name])) continue;
+          const c = await this.follow(boardId, name);
+          if (c) out.push(c);
         }
-        if (JSON.stringify(now) === JSON.stringify(seen[name])) continue;
-        const c = await this.follow(manifest.graphId, name);
-        if (c) out.push(c);
       }
       return out;
     } finally {
