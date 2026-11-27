@@ -6,7 +6,7 @@
  */
 import type { SetupKind, SetupProfile } from "../../contracts/api";
 import { BRIEF_MAX, GRAPH_SCHEMA, MEDIA_PROVIDERS, emptyBrief, type Brief, type Graph, type GraphNode, type ModelNode } from "../../contracts/graph";
-import { TEAMS, makerProvider, teamToAdd, type StarterTeam } from "../graph/teams";
+import { TEAMS, entryAgents, makerProvider, teamToAdd, type StarterTeam } from "../graph/teams";
 import { boardName, type ModelChoice } from "./presets";
 
 /** What people want their agents to do first, each answered by a starter team (graph/teams.ts). */
@@ -142,6 +142,14 @@ export function buildSetupBoard(opts: {
     graph.edges.push(...add.edges);
     lead ??= add.lead;
     skills.push(...add.skills);
+  }
+  // Two teams or more: one Assistant to talk to, who hands work to each team's lead.
+  const front = TEAMS.find((t) => t.id === "front")!;
+  if (entryAgents(graph).length >= 2) {
+    const add = teamToAdd(graph, front, graph.nodes.find((n): n is ModelNode => n.kind === "model") ?? null, newModel);
+    graph.nodes.push(...add.nodes);
+    graph.edges.push(...add.edges);
+    lead = add.lead;
   }
   const agents = graph.nodes.filter((n) => n.kind === "agent");
   // The second model takes over when the first can't answer.

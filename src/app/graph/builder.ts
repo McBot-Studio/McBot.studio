@@ -12,7 +12,7 @@ import { withRichAnswers } from "../chat/rich";
 import { AGENT_SUGGESTIONS, agentIdFor } from "../shell/agentSuggestions";
 import { CATALOG, CONNECTOR_TOOLS, catalogNode } from "./catalog";
 import { freeDisplayName, newChannel } from "./defaults";
-import { TEAMS, makerProvider } from "./teams";
+import { TEAMS, joinFrontDesk, makerProvider } from "./teams";
 
 const TOOLS = [...CATALOG, ...CONNECTOR_TOOLS];
 
@@ -206,5 +206,8 @@ export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | 
     const t = ids.get(to.toLowerCase());
     if (s && t) edges.push({ id: `edge-${uid()}`, source: s, target: t, order: 0 });
   }
-  return { nodes, edges, lead: ids.get(p.agents[0]!.name.toLowerCase())!, skills };
+  const lead = ids.get(p.agents[0]!.name.toLowerCase())!;
+  // The board's front desk (an Assistant you talk to) can hand work to the new team too.
+  edges.push(...joinFrontDesk(graph, lead));
+  return { nodes, edges, lead, skills };
 }

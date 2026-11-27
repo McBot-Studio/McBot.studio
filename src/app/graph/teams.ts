@@ -2,7 +2,7 @@
  * Starter teams: a few agents, what each does, and who hands work to whom, added to a board in one
  * click. Pure: the board in, the nodes and edges to add out (tested against the real compiler).
  */
-import { MEDIA_PROVIDERS, type Graph, type GraphEdge, type GraphNode, type ModelNode } from "../../contracts/graph";
+import { MEDIA_PROVIDERS, type AgentNode, type Graph, type GraphEdge, type GraphNode, type ModelNode } from "../../contracts/graph";
 import { withRichAnswers } from "../chat/rich";
 import { RESERVED_PROFILE_NAMES } from "../../contracts/graph";
 import { CATALOG, CONNECTOR_TOOLS, catalogNode } from "./catalog";
@@ -30,6 +30,62 @@ export interface StarterTeam {
   members: Member[];
   /** Hand-offs: [from, to] by member name. The first member leads. */
   handoffs: [string, string][];
+  /** The front desk: its lead also hands work to every agent on the board that no one hands work to (`entryAgents`). */
+  front?: boolean;
+}
+
+/** The front desk's profile id: the Assistant you talk to, who hands work to each team's lead. */
+export const FRONT_DESK = "front-desk";
+
+const agentIds = (g: Pick<Graph, "nodes">) => new Set(g.nodes.filter((n) => n.kind === "agent").map((n) => n.id));
+/** Hand-off wires: agent → agent. */
+const handoffsOf = (g: Pick<Graph, "nodes" | "edges">) => {
+  const agents = agentIds(g);
+  return g.edges.filter((e) => agents.has(e.source) && agents.has(e.target));
+};
+
+/** Agents no one hands work to: each team's lead and every agent that works alone. */
+export function entryAgents(g: Pick<Graph, "nodes" | "edges">): GraphNode[] {
+  const given = new Set(handoffsOf(g).map((e) => e.target));
+  return g.nodes.filter((n) => n.kind === "agent" && !given.has(n.id));
+}
+
+/**
+ * The board's front desk, if it has one: the Front desk team's Assistant, or any agent no one hands
+ * work to that hands work to a lead of its own (a lead of leads). A new team's lead joins it.
+ */
+export function frontDeskOf(g: Pick<Graph, "nodes" | "edges">): GraphNode | null {
+  const wires = handoffsOf(g);
+  const leads = new Set(wires.map((e) => e.source));
+  const entries = entryAgents(g);
+  return entries.find((n) => new RegExp(`^${FRONT_DESK}(-\\d+)?$`).test(String(n.data.name)))
+    ?? entries.find((n) => wires.some((e) => e.source === n.id && leads.has(e.target)))
+    ?? null;
+}
+
+/**
+ * Who to ask instead of an agent that hands work to no one: the agent at the top of the hand-offs that
+ * reach it (its team's lead, or the front desk above that). Null when it hands work on itself, or no
+ * one hands it work.
+ */
+export function leadOf(g: Pick<Graph, "nodes" | "edges">, agentId: string): AgentNode | null {
+  const wires = handoffsOf(g);
+  if (wires.some((e) => e.source === agentId)) return null;
+  let at = agentId;
+  const seen = new Set([at]);
+  for (;;) {
+    const up = wires.find((e) => e.target === at && !seen.has(e.source));
+    if (!up) break;
+    at = up.source;
+    seen.add(at);
+  }
+  return at === agentId ? null : g.nodes.find((n): n is AgentNode => n.id === at && n.kind === "agent") ?? null;
+}
+
+/** The wire from the board's front desk to a new lead, so the Assistant can give it work too. */
+export function joinFrontDesk(g: Pick<Graph, "nodes" | "edges">, lead: string): GraphEdge[] {
+  const desk = frontDeskOf(g);
+  return desk && desk.id !== lead ? [{ id: `edge-${uid()}`, source: desk.id, target: lead, order: 0 }] : [];
 }
 
 export const TEAMS: readonly StarterTeam[] = [
@@ -67,6 +123,25 @@ export const TEAMS: readonly StarterTeam[] = [
       { name: "lookup", displayName: "Lookup", description: "Finds answers in docs and past tickets.", soul: "You find answers in the docs, the shared files and past tickets, and report them with where you found them.", skills: ["official/research/qmd"] },
     ],
     handoffs: [["triage", "answers"], ["triage", "lookup"]],
+  },
+  {
+    // One agent to talk to for everything: it hands work to the lead of every team on the board.
+    id: "front", label: "Front desk", does: "One assistant you talk to; it hands work to every team on the board", front: true,
+    members: [
+      { name: FRONT_DESK, displayName: "Assistant", description: "The one you talk to: answers, or hands work to the right team.", soul: "You are the one I talk to. Answer quick questions yourself.\nFor anything bigger, give it to the teammate whose work it is as a task that says what done looks like, follow it, and tell me the result in a few lines. Split work that needs several teams.\nAsk me before anything goes public, costs money or can't be undone." },
+    ],
+    handoffs: [],
+  },
+  {
+    // Several minds on one question; best when each advisor thinks with a different model.
+    id: "council", label: "Council", does: "Three advisors answer the same question, each on its own model if you give them one; a chair weighs them",
+    members: [
+      { name: "chair", displayName: "Chair", description: "Asks the advisors and writes the final answer.", soul: "For each question, give the same question to every advisor as its own task, then wait for all of them.\nCompare their answers: where they agree, where they differ, which is strongest and why. Then write one final answer, and say where the advisors disagreed." },
+      { name: "skeptic", displayName: "Skeptic", description: "Looks for what is wrong or missing.", soul: "Answer the question, then attack your own answer: weak evidence, risks, what is missing.\nEnd with how sure you are, from 1 to 5.", tools: ["exa"] },
+      { name: "pragmatist", displayName: "Pragmatist", description: "Finds the simplest thing that works.", soul: "Answer with the simplest approach that works and the first three steps.\nEnd with how sure you are, from 1 to 5." },
+      { name: "expert", displayName: "Expert", description: "Answers in depth, with sources.", soul: "Answer in depth, as a specialist would, with sources for every fact.\nEnd with how sure you are, from 1 to 5.", tools: ["exa"] },
+    ],
+    handoffs: [["chair", "skeptic"], ["chair", "pragmatist"], ["chair", "expert"]],
   },
   {
     id: "dev", label: "Dev team", does: "A tech lead plans; a coder builds; a reviewer checks every change",
@@ -188,6 +263,10 @@ export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | nu
     edges.push({ id: `edge-${uid()}`, source: modelNode.id, target: id, order: 0 });
   });
   for (const [from, to] of team.handoffs) edges.push({ id: `edge-${uid()}`, source: ids.get(from)!, target: ids.get(to)!, order: 0 });
+  const lead = ids.get(team.members[0]!.name)!;
+  // The front desk hands work to every team already here; a new team joins the board's front desk.
+  if (team.front) for (const a of entryAgents(graph)) edges.push({ id: `edge-${uid()}`, source: lead, target: a.id, order: 0 });
+  else edges.push(...joinFrontDesk(graph, lead));
 
   // Tools and makers on the right of the team, one block each, wired to every member that uses it.
   const right = left + 340 + Math.max(1, team.members.length - 1) * 260 + 40;
@@ -222,5 +301,5 @@ export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | nu
       edges.push({ id: `edge-${uid()}`, source: agentId, target: makerIds.get(media)!, order: 0 });
     }
   }
-  return { nodes, edges, lead: ids.get(team.members[0]!.name)!, skills };
+  return { nodes, edges, lead, skills };
 }

@@ -19,6 +19,7 @@ import { RichText } from "../chat/RichText";
 import { AgentPage } from "../agent/AgentPage";
 import { ModelChip } from "../graph/Logo";
 import { isPlanStep, planOf, type PlanItem } from "../chat/plan";
+import { leadOf } from "../graph/teams";
 
 function shortTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
@@ -173,8 +174,10 @@ export function AgentMessage({ run, events, name, onChoose, waitingFor }: { run:
 }
 
 function Thread({ agent, model, info, onInfo }: { agent: AgentNode; model: string | null; info: boolean; onInfo: () => void }) {
-  const { boardId } = useBoard();
+  const { boardId, graph } = useBoard();
   const runs = useApp((s) => s.runs);
+  // An agent that hands work to no one does it all itself: point to the one who gets the team working.
+  const lead = useMemo(() => leadOf(graph, agent.id), [graph, agent.id]);
   const events = useApp((s) => s.events);
   const loadEvents = useApp((s) => s.loadEvents);
   const [draft, setDraft] = useState("");
@@ -278,6 +281,12 @@ function Thread({ agent, model, info, onInfo }: { agent: AgentNode; model: strin
               <div className="queue-paused"><span className="grow">Paused: the first one couldn't start</span>
                 <button className="btn sm" onClick={() => useApp.getState().resumeQueue(agent.id)}>Try again</button></div>
             )}
+          </div>
+        )}
+        {lead && (
+          <div className="alone-hint" data-testid="alone-hint">
+            <span data-tip={`${name} hands work to no one. ${(lead.data.displayName || lead.data.name)} gives work to the team.`}>Works alone</span>
+            <button className="btn ghost sm" onClick={() => useApp.getState().openChat(lead.id)} data-testid="ask-lead">Ask {(lead.data.displayName || lead.data.name)}</button>
           </div>
         )}
         <div className="composer">
