@@ -29,33 +29,55 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <filter id="liquid" x="-20%" y="-20%" width="140%" height="140%">
+    <feTurbulence type="fractalNoise" baseFrequency="0.012 0.04" numOctaves="2" seed="3" result="n">
+      <animate attributeName="baseFrequency" dur="9s" values="0.012 0.04;0.02 0.03;0.012 0.04" repeatCount="indefinite"/>
+    </feTurbulence>
+    <feDisplacementMap in="SourceGraphic" in2="n" scale="5" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+</svg>
 
 <header class="nav" data-nav>
-  <div class="nav-pill">
-    <a class="brand" href="#top" aria-label="McBot Studio, top of the page"><img src="assets/logo.svg" width="22" height="22" alt=""><span>McBot Studio</span></a>
-    <nav class="nav-links" aria-label="Sections">
-      <a href="#yours">Why McBot</a>
-      <a href="#models">Models</a>
-      <a href="#harness">Harness</a>
-      <a href="#work">Work</a>
-      <a href="#features">Features</a>
-      <a href="#compare">Compare</a>
-      <a href="#faq">FAQ</a>
+  <div class="nav-bar">
+    <a class="brand" href="#top" aria-label="McBot Studio, top of the page"><img src="assets/logo.svg" width="24" height="24" alt=""><span>McBot Studio</span></a>
+    <nav class="nav-menu" aria-label="Site" data-menu>
+      <div class="nav-item" data-drop>
+        <button class="nav-link" type="button" aria-expanded="false" aria-haspopup="true">Product<svg class="chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+        <div class="drop">
+          <a href="#yours"><b>Why McBot</b><small>Yours, private, never locked in</small></a>
+          <a href="#models"><b>Any model</b><small>Switch models, not apps</small></a>
+          <a href="#harness"><b>The harness</b><small>Draw your team, it runs</small></a>
+          <a href="#work"><b>Work that gets done</b><small>Tasks, questions, documents</small></a>
+          <a href="#features"><b>Features</b><small>Everything a working team needs</small></a>
+        </div>
+      </div>
+      <div class="nav-item" data-drop>
+        <button class="nav-link" type="button" aria-expanded="false" aria-haspopup="true">Resources<svg class="chev" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></button>
+        <div class="drop">
+          <a href="./demo/" data-demo><b>Browser demo</b><small>Try it without installing</small></a>
+          <a href="https://github.com/McBot-Studio/mcbot.studio/releases"><b>Releases</b><small>What's new in each version</small></a>
+          <a href="https://github.com/McBot-Studio/mcbot.studio"><b>Source code</b><small>MIT licence, on GitHub</small></a>
+          <a href="https://github.com/McBot-Studio/mcbot.studio/issues"><b>Report a problem</b><small>Or ask for a feature</small></a>
+        </div>
+      </div>
+      <a class="nav-link" href="#compare">Compare</a>
+      <a class="nav-link" href="#faq">FAQ</a>
+      <a class="nav-link" href="https://x.com/McBotstudio">News</a>
     </nav>
-    <a class="icon-link" href="https://github.com/McBot-Studio/mcbot.studio" aria-label="McBot Studio on GitHub" data-gh>
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57v-2.02c-3.34.73-4.04-1.6-4.04-1.6-.55-1.4-1.34-1.77-1.34-1.77-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.8 1.3 3.49 1 .1-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22v3.29c0 .32.22.7.82.58A12 12 0 0 0 12 .3"/></svg>
-    </a>
-    <a class="icon-link" href="https://x.com/McBotstudio" aria-label="McBot Studio on X">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M14.234 10.162 22.977 0h-2.072l-7.591 8.824L7.251 0H.258l9.168 13.343L.258 24H2.33l8.016-9.318L16.749 24h6.993zm-2.837 3.299-.929-1.329L3.076 1.56h3.182l5.965 8.532.929 1.329 7.754 11.09h-3.182z"/></svg>
-    </a>
-    <a class="btn sm light" href="#download">Download</a>
+    <div class="nav-end">
+      <a class="btn sm ghost" href="https://github.com/McBot-Studio/mcbot.studio" data-gh><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .3a12 12 0 0 0-3.8 23.38c.6.12.83-.26.83-.57v-2.02c-3.34.73-4.04-1.6-4.04-1.6-.55-1.4-1.34-1.77-1.34-1.77-1.09-.74.08-.73.08-.73 1.2.09 1.84 1.24 1.84 1.24 1.07 1.83 2.8 1.3 3.49 1 .1-.78.42-1.3.76-1.6-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.14-.3-.54-1.52.1-3.18 0 0 1-.32 3.3 1.23a11.5 11.5 0 0 1 6 0c2.28-1.55 3.29-1.23 3.29-1.23.64 1.66.24 2.88.12 3.18a4.65 4.65 0 0 1 1.23 3.22c0 4.61-2.8 5.63-5.48 5.92.42.36.81 1.1.81 2.22v3.29c0 .32.22.7.82.58A12 12 0 0 0 12 .3"/></svg><span>GitHub</span></a>
+      <span class="metal sm" data-metal><span class="metal-ring" aria-hidden="true"></span><a class="btn sm light" href="#download">Download</a></span>
+      <button class="nav-burger" type="button" aria-label="Menu" aria-expanded="false" data-burger><i></i><i></i></button>
+    </div>
   </div>
 </header>
 
 <main id="top">
 
   <!-- Hero: the mascot, one line, one action, the app itself. -->
-  <section class="hero">
+  <section class="hero" data-hero-stage>
+    <div class="ai-layer" data-ai aria-hidden="true"></div>
     <div class="bot" data-bot tabindex="0" role="button" aria-label="McBot, a glass burger. Poke it.">
       <div class="bot-float">
         <div class="bot-tilt">
@@ -67,7 +89,7 @@
     <h1 class="hero-title" data-in>AI agents that<br>stay yours.</h1>
     <p class="hero-lede" data-in style="--d:1">A team of agents that research, write, answer and get work done, on your computer, with any model. New model out? Switch in one click. Your agents keep everything they know.</p>
     <div class="hero-ctas" data-in style="--d:2">
-      <div class="split" data-split>
+      <div class="metal" data-metal><span class="metal-ring" aria-hidden="true"></span><div class="split" data-split>
         <a class="btn primary big" href="#download" data-dl-primary>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v12m0 0-5-5m5 5 5-5M5 20h14"/></svg>
           <span data-dl-label>Download</span>
@@ -78,7 +100,7 @@
           <a role="menuitem" href="#download">Windows <small>10 and 11</small></a>
           <a role="menuitem" href="#download">Linux <small>AppImage and .deb</small></a>
         </div>
-      </div>
+      </div></div>
       <a class="btn big" href="./demo/" data-demo>Try it in your browser</a>
     </div>
     <p class="hero-meta" data-in style="--d:3">
@@ -549,7 +571,6 @@
 
   <!-- Closing: the crew, and one line. -->
   <section class="closing wrap" aria-labelledby="closing-title">
-    <div class="parade" data-parade aria-hidden="true"></div>
     <h2 id="closing-title">Your team is ready when you are.</h2>
     <div class="closing-ctas">
       <a class="btn primary big" href="#download">Download McBot Studio</a>
@@ -559,6 +580,7 @@
 </main>
 
 <footer class="foot">
+  <div class="crew" data-crew aria-hidden="true"></div>
   <div class="wrap foot-grid">
     <div class="foot-pitch">
       <a class="brand" href="#top"><img src="assets/logo.svg" width="22" height="22" alt=""><span>McBot Studio</span></a>
