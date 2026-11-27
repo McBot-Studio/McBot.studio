@@ -95,25 +95,27 @@ button { font: inherit; }
 .icon-link:hover { color: var(--text); background: rgba(255, 255, 255, 0.06); }
 
 /* ---------- Liquid metal: a chrome ring that flows around the Download buttons and follows the
-   pointer (owner's ask: the one place the page uses a gradient and light) ---------- */
+   pointer (owner's ask: the one place the page uses a gradient and light). The light turns by
+   animating the gradient's angle (`--spin`), never the element, so the ring is always whole; its
+   darkest tone stays a mid grey, so no part of it ever disappears into the black page. ---------- */
 @property --spin { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
 .metal { --r: 16px; --mx: 50%; --my: 50%; position: relative; display: inline-flex; padding: 2.5px; border-radius: calc(var(--r) + 2.5px); isolation: isolate; }
 .metal.sm { --r: 999px; padding: 2px; }
-.metal-ring { position: absolute; inset: 0; z-index: -1; border-radius: inherit; overflow: hidden; }
-.metal-ring::before { content: ""; position: absolute; inset: -60%; background: conic-gradient(from var(--spin), #ffffff, #8b9099 8%, #2b2e34 16%, #e6e9ee 25%, #6c727b 34%, #fdfdfd 42%, #41454d 52%, #c3c8cf 62%, #24272c 72%, #aeb3ba 82%, #f4f6f8 91%, #ffffff); filter: url(#liquid); animation: spin 5s linear infinite; }
+.metal-ring { position: absolute; inset: 0; z-index: -1; border-radius: inherit; overflow: hidden; background: #a3a8b0; }
+.metal-ring::before { content: ""; position: absolute; inset: -12px; background: conic-gradient(from var(--spin), #ffffff, #aab0b7 8%, #61666f 16%, #e6e9ee 25%, #7d828b 34%, #fdfdfd 42%, #656a73 52%, #c9cdd3 62%, #5d626b 72%, #b4b9c0 82%, #f4f6f8 91%, #ffffff); filter: url(#liquid); animation: metal-spin 5s linear infinite; }
 .metal-ring::after { content: ""; position: absolute; inset: 0; background: radial-gradient(70px circle at var(--mx) var(--my), #fff, rgba(255, 255, 255, 0) 70%); opacity: 0; transition: opacity 0.3s; }
 .metal::after { content: ""; position: absolute; inset: -14px; z-index: -2; border-radius: inherit; background: radial-gradient(closest-side, rgba(225, 232, 244, 0.18), transparent); filter: blur(12px); opacity: 0.6; transition: opacity 0.3s; pointer-events: none; }
 .metal:hover .metal-ring::after, .metal.near .metal-ring::after { opacity: 0.9; }
-.metal:hover .metal-ring::before { animation-duration: 1.8s; }
 .metal:hover::after { opacity: 1; }
-/* Inside the ring the button is dark metal, so the chrome reads as chrome. */
+/* Inside the ring the button is dark metal, so the chrome reads as chrome. The two halves of the
+   split meet with square corners over a dark fill, so the ring never shows between them. */
 .metal .btn.primary, .metal .btn.light { background: linear-gradient(180deg, #232428, #0e0f11); color: #f5f5f7; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), inset 0 -1px 0 rgba(0, 0, 0, 0.5); }
 .metal .btn.primary:hover, .metal .btn.light:hover { background: linear-gradient(180deg, #2b2c31, #131417); }
 .metal > .btn, .metal > .split > .btn { position: relative; }
-.metal .split-more { box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.1); }
+.metal > .split { border-radius: var(--r); background: #101113; }
 .metal > .split > .btn:first-child { border-radius: var(--r) 0 0 var(--r); }
-.metal > .split > .split-more { border-radius: 0 var(--r) var(--r) 0; }
-@keyframes spin { to { --spin: 360deg; } }
+.metal > .split > .btn.split-more { border-radius: 0 var(--r) var(--r) 0; box-shadow: inset 1px 0 0 rgba(255, 255, 255, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.12), inset 0 -1px 0 rgba(0, 0, 0, 0.5); }
+@keyframes metal-spin { to { --spin: 360deg; } }
 
 /* ---------- Hero ---------- */
 .hero { display: grid; justify-items: center; padding: 116px 20px 0; text-align: center; }
@@ -661,3 +663,132 @@ h1, h2, h3, .lede, .hero-lede { text-wrap: balance; }
 .ai-sel { border-radius: 6px; box-shadow: 0 0 0 2px var(--c); background: color-mix(in srgb, var(--c) 22%, transparent); transition: background 0.3s, box-shadow 0.3s; }
 .ai-hover { filter: brightness(1.08); transform: translateY(-1px); }
 @media (max-width: 900px) { .ai-layer { display: none; } }
+
+/* ---------- You and McBot: a ring around the visitor's cursor, McBot's own cursor a beat behind,
+   and the GitHub star it brings (desktop with a mouse; elsewhere the star is a quiet note) ---------- */
+.buddy-layer { position: fixed; inset: 0; z-index: 60; pointer-events: none; opacity: 0; transition: opacity 0.35s; }
+.buddy-layer.on { opacity: 1; }
+.buddy-layer.away { opacity: 0; }
+.you-ring { position: absolute; left: 0; top: 0; width: 34px; height: 34px; margin: -17px 0 0 -17px; will-change: transform; }
+.you-ring::before { content: ""; position: absolute; inset: 0; border-radius: 50%; box-shadow: inset 0 0 0 1.5px rgba(255, 255, 255, 0.34), 0 0 0 0.5px rgba(0, 0, 0, 0.4); transition: transform 0.4s var(--spring), background 0.25s, box-shadow 0.25s; }
+.you-ring.over::before { transform: scale(1.4); background: rgba(255, 255, 255, 0.06); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55); }
+.you-ring.down::before { transform: scale(0.78); background: rgba(255, 255, 255, 0.12); transition-duration: 0.12s; }
+.buddy { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; transition: opacity 0.3s; }
+.buddy.shy { opacity: 0.15; }
+.buddy-in { position: relative; }
+.buddy.parked .buddy-in { animation: buddy-bob 2.6s ease-in-out infinite; }
+@keyframes buddy-bob { 50% { transform: translateY(-3px); } }
+.buddy .arrow { display: block; filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.55)); }
+.buddy .tag { position: absolute; left: 16px; top: 18px; display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 11px 0 5px; border-radius: 999px; background: #f5f5f7; color: #0b0b0c; font-size: 12.5px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45); }
+.buddy .tag img { width: 17px; height: 17px; }
+.buddy .say { position: absolute; left: 16px; top: 50px; padding: 7px 11px; border-radius: 10px 10px 10px 3px; background: rgba(22, 22, 24, 0.94); box-shadow: 0 0 0 0.5px var(--line-3), 0 10px 30px rgba(0, 0, 0, 0.5); color: var(--text); font-size: 12.5px; line-height: 1.35; white-space: nowrap; opacity: 0; transform: translateY(-4px) scale(0.96); transform-origin: 0 0; transition: opacity 0.25s, transform 0.3s var(--spring); }
+.buddy.saying .say { opacity: 1; transform: none; }
+.buddy .ping { position: absolute; left: -14px; top: -14px; width: 30px; height: 30px; border-radius: 50%; border: 2px solid #f5f5f7; opacity: 0; }
+.buddy.click .ping { animation: ping 0.6s var(--ease); }
+/* GitHub's star, carried by the arrow's tip */
+.buddy .carry { position: absolute; left: -15px; top: -17px; display: grid; place-items: center; width: 24px; height: 24px; color: #e3b341; filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.6)); opacity: 0; transform: scale(0.2) rotate(-60deg); transition: opacity 0.2s, transform 0.5s var(--spring); }
+.buddy .carry svg { width: 22px; height: 22px; }
+.buddy.carrying .carry { opacity: 1; transform: none; }
+.buddy.carrying.parked .carry { animation: star-turn 2.6s ease-in-out infinite; }
+@keyframes star-turn { 50% { transform: rotate(14deg) scale(1.06); } }
+/* the GitHub button: picked from, and keeping the star once it's been brought back */
+.nav-end [data-gh] { position: relative; }
+.nav-end [data-gh].gh-pick { background: rgba(255, 255, 255, 0.16); transform: scale(0.96); }
+.gh-stars { display: inline-flex; align-items: center; gap: 4px; margin-left: 2px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.gh-stars svg { width: 13px; height: 13px; }
+.gh-stars b { font-weight: 500; }
+.gh-stars[hidden] { display: none; }
+.starred .gh-stars[hidden] { display: inline-flex; }
+.starred .gh-stars svg { color: #e3b341; animation: pop 0.4s var(--spring) both; }
+/* the card McBot brings (or, without a mouse, a note at the bottom of the screen) */
+.star-card { position: fixed; z-index: 58; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 4px 12px; width: 340px; padding: 16px; border-radius: 16px; background: rgba(20, 20, 22, 0.88); backdrop-filter: saturate(180%) blur(24px); -webkit-backdrop-filter: saturate(180%) blur(24px); box-shadow: 0 0 0 0.5px var(--line-3), 0 24px 60px rgba(0, 0, 0, 0.6); opacity: 0; transform: translateY(6px) scale(0.96); transform-origin: 12px 0; transition: opacity 0.2s, transform 0.35s var(--spring); }
+.star-card[hidden] { display: none; }
+.star-card.on { opacity: 1; transform: none; }
+.st-star { color: #e3b341; }
+.st-star svg { width: 30px; height: 30px; }
+.st-t { display: grid; gap: 2px; }
+.st-t b { font-size: 15px; font-weight: 550; letter-spacing: -0.015em; }
+.st-t small { color: var(--text-2); font-size: 13px; line-height: 1.4; }
+.st-btns { grid-column: 1 / -1; display: flex; gap: 8px; margin-top: 10px; }
+.st-btns .btn { flex: 1; border-radius: 10px; }
+.st-btns .btn svg { color: #c99a2e; }
+.star-card.toast { left: 50%; top: auto; bottom: calc(16px + env(safe-area-inset-bottom)); width: min(360px, calc(100% - 32px)); margin-left: calc(min(360px, calc(100% - 32px)) / -2); transform-origin: 50% 100%; }
+@media (prefers-reduced-motion: reduce) {
+  .star-card { transition: none; transform: none; }
+}
+
+.closing .star-btn svg { color: #e3b341; }
+
+/* ---------- Built in, newer tiles: Files, the browser, versions, rich answers, checkable downloads ---------- */
+.viz-files { display: grid; grid-template-columns: 196px minmax(0, 1fr); gap: 12px; }
+.fx-tree { display: grid; align-content: start; gap: 2px; padding: 8px; border-radius: 12px; background: var(--app-card); box-shadow: inset 0 0 0 0.5px var(--app-line-2); }
+.fx-row { display: flex; align-items: center; gap: 7px; height: 24px; padding: 0 8px; overflow: hidden; border-radius: 7px; color: var(--app-text-2); font-size: 12.5px; white-space: nowrap; }
+.fx-row svg { flex: none; width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; color: var(--app-text-3); }
+.fx-row b { color: var(--app-text); font-weight: 600; }
+.fx-row.sub { padding-left: 26px; }
+.fx-row.on { background: rgba(255, 255, 255, 0.08); color: var(--app-text); }
+.fx-new { opacity: 0; transform: translateX(-6px); }
+.in .fx-new { animation: fx-new 0.45s var(--ease) 2.3s both; }
+@keyframes fx-new { from { opacity: 0; transform: translateX(-6px); background: rgba(255, 255, 255, 0.14); } to { opacity: 1; transform: none; background: transparent; } }
+.fx-main { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 8px; min-width: 0; }
+.fx-tab { display: flex; align-items: baseline; gap: 8px; padding: 2px 2px 0; color: var(--app-text); font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.fx-tab small { overflow: hidden; color: var(--app-text-3); font-size: 11.5px; font-weight: 450; text-overflow: ellipsis; }
+.fx-text { display: grid; align-content: start; gap: 4px; padding: 10px 12px; overflow: hidden; border-radius: 10px; background: #0e0e10; box-shadow: inset 0 0 0 0.5px var(--app-line-2); color: var(--app-text-2); font: 12px/1.45 var(--mono); white-space: nowrap; }
+.fx-text b { color: var(--app-text); font-weight: 600; }
+.fx-ask { display: flex; align-items: center; gap: 8px; height: 34px; padding: 0 10px; overflow: hidden; border-radius: 10px; background: var(--app-card); box-shadow: inset 0 0 0 0.5px var(--app-line-2); color: var(--app-text-3); font-size: 12.5px; white-space: nowrap; }
+.fx-drop { position: absolute; left: 0; top: 0; display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 8px; background: #2a2a30; box-shadow: 0 0 0 0.5px var(--line-3), 0 14px 30px rgba(0, 0, 0, 0.6); color: var(--app-text); font-size: 12px; white-space: nowrap; opacity: 0; pointer-events: none; }
+.fx-drop svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linejoin: round; }
+.in .fx-drop { animation: fx-drop 2.5s var(--ease) 0.5s both; }
+@keyframes fx-drop {
+  0% { opacity: 0; transform: translate(420px, 150px) rotate(-6deg) scale(0.96); }
+  18% { opacity: 1; transform: translate(400px, 130px) rotate(-5deg); }
+  72% { opacity: 1; transform: translate(52px, 70px) rotate(-2deg); }
+  88%, 100% { opacity: 0; transform: translate(48px, 74px) scale(0.9); }
+}
+.viz-browser { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; gap: 10px; }
+.bw-bar { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border-radius: 9px; background: var(--app-card); box-shadow: inset 0 0 0 0.5px var(--app-line-2); color: var(--app-text-2); font-size: 12px; }
+.bw-bar svg { flex: none; width: 13px; height: 13px; fill: none; stroke: var(--app-text-3); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.bw-bar .bw-key { stroke: var(--app-text); }
+.bw-url { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bw-page { display: grid; align-content: start; gap: 9px; padding: 6px 4px; }
+.bw-page i { display: block; width: var(--w); height: 8px; border-radius: 4px; background: rgba(255, 255, 255, 0.08); }
+.bw-page i:first-child { height: 12px; background: rgba(255, 255, 255, 0.16); }
+.bw-ask { display: flex; flex-wrap: wrap; gap: 6px; }
+.bw-ask span { padding: 5px 10px; border-radius: 8px; background: rgba(255, 255, 255, 0.06); box-shadow: inset 0 0 0 0.5px var(--app-line-2); color: var(--app-text-2); font-size: 12px; }
+.bw-ask span.on { background: #f5f5f7; box-shadow: none; color: #0b0b0c; font-weight: 600; }
+.viz-history { display: grid; align-content: start; gap: 6px; }
+.hv { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 10px; background: var(--app-card); box-shadow: inset 0 0 0 0.5px var(--app-line-2); }
+.hv.on { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22); }
+.hv-n { display: grid; place-items: center; height: 22px; border-radius: 6px; background: rgba(255, 255, 255, 0.07); color: var(--app-text-2); font: 600 11.5px var(--mono); }
+.hv-t { display: grid; min-width: 0; }
+.hv-t b { overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.hv-t small { color: var(--app-text-3); font-size: 11.5px; }
+.hv-s { display: grid; justify-items: end; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.25; }
+.hv-s small { color: var(--app-text-3); font-size: 10.5px; font-weight: 500; }
+.hv.on .hv-s { color: var(--ok); }
+.hv-r { padding: 4px 10px; border-radius: 7px; background: #f5f5f7; color: #0b0b0c; font-size: 11.5px; font-weight: 650; }
+.viz-rich { display: grid; place-items: center; }
+.ra-card { display: grid; gap: 10px; width: min(320px, 100%); padding: 12px 14px; border-radius: 13px; background: var(--app-card); box-shadow: inset 0 0 0 0.5px var(--app-line-2), 0 20px 40px -20px rgba(0, 0, 0, 0.8); }
+.ra-who { display: flex; align-items: center; gap: 7px; font-size: 12.5px; white-space: nowrap; }
+.ra-who b { font-weight: 600; }
+.ra-who small { margin-left: auto; overflow: hidden; color: var(--app-text-3); font-size: 11.5px; text-overflow: ellipsis; }
+.ra-bars { display: flex; align-items: flex-end; gap: 6px; height: 62px; padding-bottom: 1px; box-shadow: inset 0 -0.5px 0 var(--app-line-2); }
+.ra-bars i { flex: 1; height: 6%; border-radius: 4px 4px 2px 2px; background: rgba(255, 255, 255, 0.16); transition: height 0.8s var(--spring); }
+.in .ra-bars i { height: var(--h); }
+.ra-bars i:nth-child(2) { transition-delay: 50ms; } .ra-bars i:nth-child(3) { transition-delay: 100ms; } .ra-bars i:nth-child(4) { transition-delay: 150ms; }
+.ra-bars i:nth-child(5) { transition-delay: 200ms; } .ra-bars i:nth-child(6) { transition-delay: 250ms; } .ra-bars i:nth-child(7) { transition-delay: 300ms; }
+.ra-bars i.now { background: var(--accent); }
+.ra-choices { display: flex; flex-wrap: wrap; gap: 6px; }
+.ra-choices span { padding: 5px 11px; border-radius: 8px; background: rgba(255, 255, 255, 0.08); box-shadow: inset 0 0 0 0.5px var(--app-line-2); font-size: 12px; font-weight: 600; }
+.viz-verify .tm-body { gap: 4px; font-size: 10.5px; }
+.viz-verify .tm-body div { overflow-wrap: anywhere; }
+.qa code { padding: 1px 5px; border-radius: 5px; background: rgba(255, 255, 255, 0.07); color: var(--text); font: 13.5px var(--mono); overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .viz-files { grid-template-columns: minmax(0, 1fr); }
+  .fx-main { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fx-drop { display: none; }
+  .fx-new { opacity: 1; transform: none; animation: none !important; }
+  .ra-bars i { height: var(--h); transition: none; }
+}
