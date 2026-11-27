@@ -6,7 +6,7 @@
  */
 import type { SetupKind, SetupProfile } from "../../contracts/api";
 import { BRIEF_MAX, GRAPH_SCHEMA, MEDIA_PROVIDERS, emptyBrief, type Brief, type Graph, type GraphNode, type ModelNode } from "../../contracts/graph";
-import { TEAMS, makerProvider, teamToAdd, type StarterTeam } from "../graph/teams";
+import { TEAMS, entryAgents, makerProvider, teamToAdd, type StarterTeam } from "../graph/teams";
 import { boardName, type ModelChoice } from "./presets";
 
 /** What people want their agents to do first, each answered by a starter team (graph/teams.ts). */
@@ -17,7 +17,7 @@ export const GOALS: { id: string; label: string; sub: string; team: string }[] =
   { id: "support", label: "Customer support", sub: "Answer and route questions", team: "support" },
   { id: "research", label: "Research & reports", sub: "Sources, summaries, write-ups", team: "research" },
   { id: "launch", label: "Launch something", sub: "Page, posts and a video", team: "launch" },
-  { id: "dev", label: "Software", sub: "Plan, code and review", team: "dev" },
+  { id: "dev", label: "Apps & software", sub: "Build, test and check apps", team: "studio" },
   { id: "markets", label: "Markets & finance", sub: "Watch, model, brief", team: "markets" },
   { id: "knowledge", label: "A knowledge base", sub: "A wiki that stays up to date", team: "knowledge" },
   { id: "personal", label: "Everyday help", sub: "Plan days, draft mail, look things up", team: "personal" },
@@ -116,14 +116,14 @@ export function buildSetupBoard(opts: {
   workspace: string;
   /** The image/video service: one of Hermes' maker services, or "huggingface" (its connector instead of a maker). */
   maker?: string | null;
-}): { graph: Graph; lead: string | null; skills: { profile: string; who: string; ids: readonly string[] }[] } {
+}): { graph: Graph; lead: string | null; skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] } {
   const graph: Graph = { schema: GRAPH_SCHEMA, id: "setup", name: boardName(opts.profile), nodes: [], edges: [] };
   const models: ModelNode[] = opts.models.map((m, i) => ({
     id: `model-${m.endpoint}`, kind: "model", position: { x: -420, y: i * 200 },
     data: { name: m.endpoint, label: m.label, endpoint: m.endpoint, baseUrl: m.baseUrl, model: m.model, apiKeyEnv: m.endpoint === "cloud" ? m.apiKeyEnv : "", pricing: null },
   }));
   graph.nodes.push(...models);
-  const skills: { profile: string; who: string; ids: readonly string[] }[] = [];
+  const skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] = [];
   let lead: string | null = null;
   // With no model yet the agents still go on the board; a local model block waits to be set.
   const newModel = (position: { x: number; y: number }): GraphNode => ({
@@ -142,6 +142,14 @@ export function buildSetupBoard(opts: {
     graph.edges.push(...add.edges);
     lead ??= add.lead;
     skills.push(...add.skills);
+  }
+  // Two teams or more: one Assistant to talk to, who hands work to each team's lead.
+  const front = TEAMS.find((t) => t.id === "front")!;
+  if (entryAgents(graph).length >= 2) {
+    const add = teamToAdd(graph, front, graph.nodes.find((n): n is ModelNode => n.kind === "model") ?? null, newModel);
+    graph.nodes.push(...add.nodes);
+    graph.edges.push(...add.edges);
+    lead = add.lead;
   }
   const agents = graph.nodes.filter((n) => n.kind === "agent");
   // The second model takes over when the first can't answer.

@@ -46,7 +46,9 @@ describe("onboarding", () => {
     const { graph } = buildSetupBoard({ profile: company, brief: briefFromSetup(company, emptyAnswers()), teams, skip: new Set([memberKey(social, "social")]), models: [cloud], workspace: "/w", maker: "fal" });
     const { bundles, issues } = resolveGraph(graph);
     expect(issues.filter((i) => i.level === "error")).toEqual([]);
-    expect(bundles.map((b) => b.agent.data.name).sort()).toEqual(["designer", "marketing", "outreach", "prospector"]);
+    expect(bundles.map((b) => b.agent.data.name).sort()).toEqual(["designer", "front-desk", "marketing", "outreach", "prospector"]);
+    // Two teams: one Assistant to talk to, handing work to each team's lead.
+    expect(bundles.find((b) => b.agent.data.name === "front-desk")!.team.map((t) => t.data.name).sort()).toEqual(["marketing", "prospector"]);
     expect(bundles.find((b) => b.agent.data.name === "designer")!.image?.data.provider).toBe("fal");
     expect(bundles.find((b) => b.agent.data.name === "marketing")!.team.map((t) => t.data.name)).toEqual(["designer"]);
   });

@@ -2,7 +2,7 @@
  * Starter teams: a few agents, what each does, and who hands work to whom, added to a board in one
  * click. Pure: the board in, the nodes and edges to add out (tested against the real compiler).
  */
-import { MEDIA_PROVIDERS, type Graph, type GraphEdge, type GraphNode, type ModelNode } from "../../contracts/graph";
+import { MEDIA_PROVIDERS, type AgentNode, type Graph, type GraphEdge, type GraphNode, type ModelNode } from "../../contracts/graph";
 import { withRichAnswers } from "../chat/rich";
 import { RESERVED_PROFILE_NAMES } from "../../contracts/graph";
 import { CATALOG, CONNECTOR_TOOLS, catalogNode } from "./catalog";
@@ -30,6 +30,62 @@ export interface StarterTeam {
   members: Member[];
   /** Hand-offs: [from, to] by member name. The first member leads. */
   handoffs: [string, string][];
+  /** The front desk: its lead also hands work to every agent on the board that no one hands work to (`entryAgents`). */
+  front?: boolean;
+}
+
+/** The front desk's profile id: the Assistant you talk to, who hands work to each team's lead. */
+export const FRONT_DESK = "front-desk";
+
+const agentIds = (g: Pick<Graph, "nodes">) => new Set(g.nodes.filter((n) => n.kind === "agent").map((n) => n.id));
+/** Hand-off wires: agent → agent. */
+const handoffsOf = (g: Pick<Graph, "nodes" | "edges">) => {
+  const agents = agentIds(g);
+  return g.edges.filter((e) => agents.has(e.source) && agents.has(e.target));
+};
+
+/** Agents no one hands work to: each team's lead and every agent that works alone. */
+export function entryAgents(g: Pick<Graph, "nodes" | "edges">): GraphNode[] {
+  const given = new Set(handoffsOf(g).map((e) => e.target));
+  return g.nodes.filter((n) => n.kind === "agent" && !given.has(n.id));
+}
+
+/**
+ * The board's front desk, if it has one: the Front desk team's Assistant, or any agent no one hands
+ * work to that hands work to a lead of its own (a lead of leads). A new team's lead joins it.
+ */
+export function frontDeskOf(g: Pick<Graph, "nodes" | "edges">): GraphNode | null {
+  const wires = handoffsOf(g);
+  const leads = new Set(wires.map((e) => e.source));
+  const entries = entryAgents(g);
+  return entries.find((n) => new RegExp(`^${FRONT_DESK}(-\\d+)?$`).test(String(n.data.name)))
+    ?? entries.find((n) => wires.some((e) => e.source === n.id && leads.has(e.target)))
+    ?? null;
+}
+
+/**
+ * Who to ask instead of an agent that hands work to no one: the agent at the top of the hand-offs that
+ * reach it (its team's lead, or the front desk above that). Null when it hands work on itself, or no
+ * one hands it work.
+ */
+export function leadOf(g: Pick<Graph, "nodes" | "edges">, agentId: string): AgentNode | null {
+  const wires = handoffsOf(g);
+  if (wires.some((e) => e.source === agentId)) return null;
+  let at = agentId;
+  const seen = new Set([at]);
+  for (;;) {
+    const up = wires.find((e) => e.target === at && !seen.has(e.source));
+    if (!up) break;
+    at = up.source;
+    seen.add(at);
+  }
+  return at === agentId ? null : g.nodes.find((n): n is AgentNode => n.id === at && n.kind === "agent") ?? null;
+}
+
+/** The wire from the board's front desk to a new lead, so the Assistant can give it work too. */
+export function joinFrontDesk(g: Pick<Graph, "nodes" | "edges">, lead: string): GraphEdge[] {
+  const desk = frontDeskOf(g);
+  return desk && desk.id !== lead ? [{ id: `edge-${uid()}`, source: desk.id, target: lead, order: 0 }] : [];
 }
 
 export const TEAMS: readonly StarterTeam[] = [
@@ -69,6 +125,25 @@ export const TEAMS: readonly StarterTeam[] = [
     handoffs: [["triage", "answers"], ["triage", "lookup"]],
   },
   {
+    // One agent to talk to for everything: it hands work to the lead of every team on the board.
+    id: "front", label: "Front desk", does: "One assistant you talk to; it hands work to every team on the board", front: true,
+    members: [
+      { name: FRONT_DESK, displayName: "Assistant", description: "The one you talk to: answers, or hands work to the right team.", soul: "You are the one I talk to. Answer quick questions yourself.\nFor anything bigger, give it to the teammate whose work it is as a task that says what done looks like, follow it, and tell me the result in a few lines. Split work that needs several teams.\nAsk me before anything goes public, costs money or can't be undone." },
+    ],
+    handoffs: [],
+  },
+  {
+    // Several minds on one question; best when each advisor thinks with a different model.
+    id: "council", label: "Council", does: "Three advisors answer the same question, each on its own model if you give them one; a chair weighs them",
+    members: [
+      { name: "chair", displayName: "Chair", description: "Asks the advisors and writes the final answer.", soul: "For each question, give the same question to every advisor as its own task, then wait for all of them.\nCompare their answers: where they agree, where they differ, which is strongest and why. Then write one final answer, and say where the advisors disagreed." },
+      { name: "skeptic", displayName: "Skeptic", description: "Looks for what is wrong or missing.", soul: "Answer the question, then attack your own answer: weak evidence, risks, what is missing.\nEnd with how sure you are, from 1 to 5.", tools: ["exa"] },
+      { name: "pragmatist", displayName: "Pragmatist", description: "Finds the simplest thing that works.", soul: "Answer with the simplest approach that works and the first three steps.\nEnd with how sure you are, from 1 to 5." },
+      { name: "expert", displayName: "Expert", description: "Answers in depth, with sources.", soul: "Answer in depth, as a specialist would, with sources for every fact.\nEnd with how sure you are, from 1 to 5.", tools: ["exa"] },
+    ],
+    handoffs: [["chair", "skeptic"], ["chair", "pragmatist"], ["chair", "expert"]],
+  },
+  {
     id: "dev", label: "Dev team", does: "A tech lead plans; a coder builds; a reviewer checks every change",
     members: [
       { name: "tech-lead", displayName: "Tech lead", description: "Plans changes and hands them out.", soul: "You plan software changes, split them into small tasks for the coder, and send finished work to the reviewer.\nKeep changes small." },
@@ -76,6 +151,20 @@ export const TEAMS: readonly StarterTeam[] = [
       { name: "reviewer", displayName: "Reviewer", description: "Reviews every change.", soul: "You review code changes for bugs, security and clarity.\nBe specific: file, line, what to change.", skills: ["official/software-development/ast-grep", "official/software-development/grill-me"] },
     ],
     handoffs: [["tech-lead", "coder"], ["tech-lead", "reviewer"]],
+  },
+  {
+    // The one to talk to is the project manager: it splits the work and hands every piece out.
+    id: "studio", label: "App studio", does: "A project manager you talk to; a team researches, designs, builds, tests and checks your apps",
+    members: [
+      { name: "pm", displayName: "Project manager", description: "Your one contact: plans the work and hands it out.", soul: "You are the one I talk to. Turn each request into a short plan and hand every piece to the right teammate as a task that says what done looks like; do not build it yourself.\nOrder the work: research, design, build, test, then check. Send work back to the coder when the tester or reviewer finds problems.\nAnswer with what was done, how to open it, and what is left. Ask me before anything goes public or costs money." },
+      { name: "researcher", displayName: "Researcher", description: "Finds how others solve it and what to build with.", soul: "You research before anything is built: similar products, libraries, APIs and their limits.\nShort bullets with links, then recommend one option.", skills: ["official/research/parallel-cli"], tools: ["exa"] },
+      { name: "designer", displayName: "Designer", description: "Designs the screens, flows and icons.", soul: "You design each app's screens, flows and icon: a mockup first, flat and readable, then what the coder needs (sizes, colours, states).\nMake the images yourself with your image tool.", skills: ["official/creative/impeccable", "official/creative/design-md"], makers: ["image"] },
+      { name: "coder", displayName: "Coder", description: "Builds the apps and features.", soul: "You build what the task asks for in small, working steps: a web app that runs on this computer unless told otherwise, started with one command and explained in a README.\nWhen it serves a page, give its address (http://127.0.0.1:<port>) so it opens in McBot's Browser. Say what you changed and how to try it.", skills: ["official/software-development/ast-grep", "official/software-development/node-inspect-debugger"], tools: ["context7"] },
+      { name: "tester", displayName: "Tester", description: "Tests every change like a user would.", soul: "You test each change: run it, use it like a real user, try to break it, and add tests where they help.\nReport each failure with exact steps to reproduce; say plainly when it passes.", skills: ["official/dogfood/adversarial-ux-test", "official/software-development/rest-graphql-debug"], tools: ["browser"] },
+      { name: "reviewer", displayName: "Reviewer", description: "Checks the work against what was asked.", soul: "You check finished work against the task: every requirement met, the code safe and readable.\nBe specific: file, line, what to change. End with done or not done.", skills: ["official/software-development/ast-grep", "official/software-development/grill-me"] },
+      { name: "data-scout", displayName: "Data scout", description: "Browses sites and gathers the data apps need.", soul: "You collect the data an app needs from the web and from files: browse, extract, clean, and save it as CSV or JSON with where each piece came from.\nRespect each site's terms; never sign in anywhere without my OK.", skills: ["official/research/scrapling"], tools: ["browser", "exa"] },
+    ],
+    handoffs: [["pm", "researcher"], ["pm", "designer"], ["pm", "coder"], ["pm", "tester"], ["pm", "reviewer"], ["pm", "data-scout"]],
   },
   {
     id: "content", label: "Content studio", does: "An editor plans posts; a writer drafts; a designer makes the images",
@@ -148,7 +237,7 @@ const TOOLS = [...CATALOG, ...CONNECTOR_TOOLS];
  * The nodes and edges that add `team` to `graph`: below what is there, ids unique, each agent wired
  * to `model` (or a new local model when the board has none).
  */
-export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | null, newModel: (pos: { x: number; y: number }) => GraphNode): { nodes: GraphNode[]; edges: GraphEdge[]; lead: string; skills: { profile: string; who: string; ids: readonly string[] }[] } {
+export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | null, newModel: (pos: { x: number; y: number }) => GraphNode): { nodes: GraphNode[]; edges: GraphEdge[]; lead: string; skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] } {
   const taken = new Set(graph.nodes.filter((n) => n.kind === "agent").map((n) => String(n.data.name)));
   const top = Math.max(0, ...graph.nodes.map((n) => n.position.y + 200));
   const left = Math.min(0, ...graph.nodes.map((n) => n.position.x));
@@ -157,14 +246,14 @@ export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | nu
   const modelNode = model ?? newModel({ x: left, y: top + 120 });
   if (!model) nodes.push(modelNode);
   const ids = new Map<string, string>();
-  const skills: { profile: string; who: string; ids: readonly string[] }[] = [];
+  const skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] = [];
   const shown: string[] = [];
   team.members.forEach((m, i) => {
     let name = m.name;
     for (let n = 2; taken.has(name) || RESERVED_PROFILE_NAMES.includes(name); n++) name = `${m.name}-${n}`;
     taken.add(name);
-    if (m.skills?.length) skills.push({ profile: name, who: m.displayName, ids: m.skills });
     const id = `agent-${uid()}`;
+    if (m.skills?.length) skills.push({ profile: name, who: m.displayName, ids: m.skills, nodeId: id });
     ids.set(m.name, id);
     // The lead on top, its team in a row below: hand-offs read top to bottom.
     const position = i === 0 ? { x: left + 340 + ((team.members.length - 2) * 260) / 2, y: top } : { x: left + 340 + (i - 1) * 260, y: top + 240 };
@@ -174,6 +263,10 @@ export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | nu
     edges.push({ id: `edge-${uid()}`, source: modelNode.id, target: id, order: 0 });
   });
   for (const [from, to] of team.handoffs) edges.push({ id: `edge-${uid()}`, source: ids.get(from)!, target: ids.get(to)!, order: 0 });
+  const lead = ids.get(team.members[0]!.name)!;
+  // The front desk hands work to every team already here; a new team joins the board's front desk.
+  if (team.front) for (const a of entryAgents(graph)) edges.push({ id: `edge-${uid()}`, source: lead, target: a.id, order: 0 });
+  else edges.push(...joinFrontDesk(graph, lead));
 
   // Tools and makers on the right of the team, one block each, wired to every member that uses it.
   const right = left + 340 + Math.max(1, team.members.length - 1) * 260 + 40;
@@ -208,5 +301,5 @@ export function teamToAdd(graph: Graph, team: StarterTeam, model: ModelNode | nu
       edges.push({ id: `edge-${uid()}`, source: agentId, target: makerIds.get(media)!, order: 0 });
     }
   }
-  return { nodes, edges, lead: ids.get(team.members[0]!.name)!, skills };
+  return { nodes, edges, lead, skills };
 }

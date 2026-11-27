@@ -12,7 +12,7 @@ import { addEdge, addNode, setNodeField, updateEdge } from "../../board/ydoc";
 import type { LearnAgentView, LearnView as LearnData, TrainJob } from "../../contracts/api";
 import type { AgentNode, Check, GraphNode } from "../../contracts/graph";
 import { CHECK_KINDS, CHECK_LABELS, MIN_TRAIN_EXAMPLES, type DatasetFormat, type DatasetPick } from "../../harness/learn";
-import { compileBoard, learnSkills } from "../actions";
+import { compileBoard, compiledAs, learnSkills } from "../actions";
 import { newId, uniqueName } from "../graph/defaults";
 import { freeSpot } from "../graph/place";
 import { engine, REMOTE } from "../lib/engine";
@@ -150,8 +150,11 @@ function Train({ agent, stats, onStarted }: { agent: AgentNode; stats: LearnAgen
       const data = await engine.exportDataset(boardId, agent.id, "chat", pick);
       if (!data.examples) throw new Error(pick === "good" ? "Nothing good enough yet: rate some answers, or add checks" : "No finished conversations yet");
       // The Trainer: on the board already, or added now with the same models as this agent.
-      if (!graph.nodes.some((n) => n.kind === "agent" && n.data.name === TRAINER_NAME)) {
+      // Its id may be "trainer-2" when another board has a Trainer too (src/harness/ledger.ts).
+      let trainerId = graph.nodes.find((n) => n.kind === "agent" && new RegExp(`^${TRAINER_NAME}(-\\d+)?$`).test(String(n.data.name)))?.id;
+      if (!trainerId) {
         const node: GraphNode = { id: newId("agent"), kind: "agent", position: freeSpot(graph, "agent", null, agent.id), data: trainerData() };
+        trainerId = node.id;
         const g = { ...graph, nodes: [...graph.nodes, node] };
         const models = chainOf(graph, agent.id).map((e) => otherEnd(e, agent.id)!);
         doc.transact(() => {
@@ -164,9 +167,10 @@ function Train({ agent, stats, onStarted }: { agent: AgentNode; stats: LearnAgen
         });
       }
       if (!(await compileBoard(boardId, { quiet: true }))) throw new Error("Compile the board first (⌘S), then try again");
-      await learnSkills(TRAINER_NAME, "Trainer", TRAINER_SKILLS, true);
+      const trainer = compiledAs(trainerId) ?? TRAINER_NAME;
+      await learnSkills(trainer, "Trainer", TRAINER_SKILLS, true);
       const { title, body } = trainerTask({ agent: name, dataset: data.path, examples: data.examples, baseModel: localBase });
-      const task = await engine.createTask(boardId, { title, body, assignee: TRAINER_NAME, by: identity.name, goal: true });
+      const task = await engine.createTask(boardId, { title, body, assignee: trainer, by: identity.name, goal: true });
       app.toast({ kind: "ok", text: `Trainer is on it: ${data.examples} conversations`, action: { label: "Open", run: () => useApp.getState().showTask(task.id) } });
       onStarted();
     } catch (err) {

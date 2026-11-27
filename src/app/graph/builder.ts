@@ -12,7 +12,7 @@ import { withRichAnswers } from "../chat/rich";
 import { AGENT_SUGGESTIONS, agentIdFor } from "../shell/agentSuggestions";
 import { CATALOG, CONNECTOR_TOOLS, catalogNode } from "./catalog";
 import { freeDisplayName, newChannel } from "./defaults";
-import { makerProvider } from "./teams";
+import { TEAMS, joinFrontDesk, makerProvider } from "./teams";
 
 const TOOLS = [...CATALOG, ...CONNECTOR_TOOLS];
 
@@ -27,6 +27,28 @@ const card = (name: string, rename?: string, makers: PlanAgent["makers"] = []): 
   return { name: rename ?? s.name, about: s.about, soul: s.soul, skills: [...(s.skills ?? [])], tools: [], chatApps: [], makers };
 };
 const own = (name: string, about: string, soul: string, skills: string[] = []): PlanAgent => ({ name, about, soul, skills, tools: [], chatApps: [], makers: [] });
+
+/** A member of the App studio starter team (graph/teams.ts) as a plan's agent. */
+const studio = (name: string): PlanAgent => {
+  const m = TEAMS.find((t) => t.id === "studio")!.members.find((x) => x.name === name)!;
+  return { name: m.displayName, about: m.description, soul: m.soul, skills: [...(m.skills ?? [])], tools: [...(m.tools ?? [])], chatApps: [], makers: [...(m.makers ?? [])] };
+};
+const STUDIO = ["pm", "researcher", "designer", "coder", "tester", "reviewer"];
+
+/** Asking for software to be built (an app, a plugin, a CRM): that is a builders' team, not a sales one. */
+const BUILDING = /\b(dev(elopment)?|software|engineering|coding) team\b|\b(build|make|create|develop|code|ship)\w*\b[^.!?]{0,60}\b(apps?|crm|plugins?|features?|tools?|dashboards?|software|saas|programs?|extensions?)\b/i;
+
+/** Roles the request names outright ("a coder, a tester and a designer"): exactly those agents. */
+const NAMED: { match: RegExp; agent: () => PlanAgent }[] = [
+  { match: /\b(project|product) managers?\b|\bpms?\b/i, agent: () => studio("pm") },
+  { match: /\bresearchers?\b/i, agent: () => studio("researcher") },
+  { match: /\bdesigners?\b/i, agent: () => studio("designer") },
+  { match: /\bcoders?\b|\bprogrammers?\b|\bdevs?\b|\bdevelopers?\b|\bengineers?\b/i, agent: () => studio("coder") },
+  { match: /\btesters?\b|\bqa\b/i, agent: () => studio("tester") },
+  { match: /\bverif(y|ier|iers|ies)\b|\breviewers?\b/i, agent: () => studio("reviewer") },
+  { match: /\bdata (scout|agent|collector|scraper)s?\b|\bbrows\w* (the )?(web|data|sites?)\b|\bscrap(e|er|ers|ing)\b|agents? that brows/i, agent: () => studio("data-scout") },
+  { match: /\bwriters?\b|\bcopywriters?\b/i, agent: () => card("Writing Partner", "Writer") },
+];
 
 /** Words → roles, most specific first. Each role is a starting card or a small agent of its own. */
 const ROLES: { match: RegExp; agent: () => PlanAgent; tools?: string[] }[] = [
@@ -65,19 +87,39 @@ const APP_WORDS: [RegExp, PlatformId][] = [
   [/\bteams\b|microsoft teams/i, "teams"], [/signal/i, "signal"], [/\bsms\b|text message/i, "sms"], [/e-?mail/i, "email"],
 ];
 
-/** A plan from the words alone: roles by keyword, a lead when there are three or more, named tools and chat apps. */
+/**
+ * A plan from the words alone. Roles the request names come first (a project manager among them leads);
+ * a request to build software gets the App studio team; otherwise roles by topic, with a lead when there
+ * are three or more. Named tools and chat apps are added.
+ */
 export function quickPlan(request: string): HarnessPlan {
   const text = request.trim();
-  const roles = ROLES.filter((r) => r.match.test(text)).slice(0, 5);
-  let agents: PlanAgent[] = roles.map((r) => ({ ...r.agent(), tools: [...(r.tools ?? [])] }));
+  const named = NAMED.filter((r) => r.match.test(text)).map((r) => r.agent());
+  let agents: PlanAgent[];
+  if (BUILDING.test(text)) {
+    // The whole studio, plus any other role asked for by name.
+    agents = STUDIO.map(studio);
+    for (const a of named) if (!agents.some((x) => x.name === a.name)) agents.push(a);
+  } else if (named.length) {
+    agents = named;
+  } else {
+    agents = ROLES.filter((r) => r.match.test(text)).slice(0, 5).map((r) => ({ ...r.agent(), tools: [...(r.tools ?? [])] }));
+  }
   if (agents.length === 0) agents = [own("Assistant", text.slice(0, 150) || "Helps with everyday work.", "Be brief and practical.\nAsk one question when something is unclear.")];
+  // A project manager is the one the person talks to: first, handing work to the rest.
+  const pm = studio("pm").name;
+  const managed = agents.some((a) => a.name === pm) && agents.length > 1;
+  if (managed) agents = [agents.find((a) => a.name === pm)!, ...agents.filter((a) => a.name !== pm)];
+  agents = agents.slice(0, 8);
   const tools = TOOL_WORDS.filter(([re]) => re.test(text)).map(([, id]) => id);
-  for (const a of agents) a.tools = [...new Set([...a.tools, ...tools])].slice(0, 4);
+  for (const a of managed ? agents.slice(1) : agents) a.tools = [...new Set([...a.tools, ...tools])].slice(0, 4);
   // The loop layer: only when asked to keep it short or cheap (Hermes' own default is no cap).
   if (/quick|cheap|budget|fast|short/i.test(text)) for (const a of agents) a.maxSteps = 25;
 
   const handoffs: [string, string][] = [];
-  if (agents.length >= 3) {
+  if (managed) {
+    for (const a of agents.slice(1)) handoffs.push([pm, a.name]);
+  } else if (agents.length >= 3) {
     const lead = own("Lead", "Plans the work and hands it out.", `You lead this team: ${agents.map((a) => a.name).join(", ")}.\nSplit each request into tasks, hand them out, check the results, then answer.`);
     for (const a of agents) handoffs.push([lead.name, a.name]);
     agents = [lead, ...agents];
@@ -98,7 +140,7 @@ const uid = () => Math.random().toString(36).slice(2, 10);
  * to `model` (or one new model), their tools and chat apps beside them, and the hand-offs. Profile
  * names are made unique; the skills come back to install once the agents are compiled.
  */
-export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | null, newModel: (pos: { x: number; y: number }) => GraphNode): { nodes: GraphNode[]; edges: GraphEdge[]; lead: string; skills: { profile: string; who: string; ids: readonly string[] }[] } {
+export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | null, newModel: (pos: { x: number; y: number }) => GraphNode): { nodes: GraphNode[]; edges: GraphEdge[]; lead: string; skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] } {
   const p = restrictPlan(plan, PLAN_CHOICES);
   const taken = new Set(graph.nodes.filter((n) => n.kind === "agent").map((n) => String(n.data.name)));
   const toolNames = new Set(graph.nodes.filter((n) => n.kind === "tool").map((n) => String(n.data.name)));
@@ -109,7 +151,7 @@ export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | 
   const modelNode = model ?? newModel({ x: left, y: top + 120 });
   if (!model) nodes.push(modelNode);
   const ids = new Map<string, string>();
-  const skills: { profile: string; who: string; ids: readonly string[] }[] = [];
+  const skills: { profile: string; who: string; ids: readonly string[]; nodeId?: string }[] = [];
   const workGraph: Graph = { ...graph, nodes: [...graph.nodes] };
   /** One block per tool, shared by every agent in the plan that uses it. */
   const toolBlocks = new Map<string, string>();
@@ -129,7 +171,7 @@ export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | 
     shown.push(displayName);
     nodes.push({ id, kind: "agent", position, data: { name: profile, displayName, description: a.about, soul: withRichAnswers(a.soul), skills: [], capabilities: null, ...(a.maxSteps ? { maxSteps: a.maxSteps } : {}) } });
     edges.push({ id: `edge-${uid()}`, source: modelNode.id, target: id, order: 0 });
-    if (a.skills.length) skills.push({ profile, who: a.name, ids: a.skills });
+    if (a.skills.length) skills.push({ profile, who: a.name, ids: a.skills, nodeId: id });
     a.tools.forEach((t, k) => {
       let block = toolBlocks.get(t);
       if (!block) {
@@ -164,5 +206,8 @@ export function planToBoard(plan: HarnessPlan, graph: Graph, model: ModelNode | 
     const t = ids.get(to.toLowerCase());
     if (s && t) edges.push({ id: `edge-${uid()}`, source: s, target: t, order: 0 });
   }
-  return { nodes, edges, lead: ids.get(p.agents[0]!.name.toLowerCase())!, skills };
+  const lead = ids.get(p.agents[0]!.name.toLowerCase())!;
+  // The board's front desk (an Assistant you talk to) can hand work to the new team too.
+  edges.push(...joinFrontDesk(graph, lead));
+  return { nodes, edges, lead, skills };
 }

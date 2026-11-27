@@ -41,6 +41,11 @@ export interface MemoryFile {
   sha256: string | null;
 }
 
+/** An agent's memory before it has any: its file is not there yet. */
+export function emptyMemory(profile: string, target: MemoryTarget): MemoryFile {
+  return { target, path: `profiles/${profile}/memories/${FILES[target]}`, exists: false, entries: [], chars: 0, limit: MEMORY_CHAR_LIMITS[target], sha256: null };
+}
+
 export async function readMemory(root: string, profile: string, target: MemoryTarget): Promise<MemoryFile> {
   const rel = `profiles/${profile}/memories/${FILES[target]}`;
   const raw = await readTextOrNull(resolveInside(root, rel));

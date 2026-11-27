@@ -2,9 +2,10 @@
  * Writes a CompileResult under an output root (a Hermes home) and reports a
  * per-file diff. The only module that writes compiled files to disk.
  *
- * Ownership rule: McBot owns exactly the files its previous manifest lists.
- * It never deletes anything else, and it refuses to write into a profile
- * directory it did not create — so pointing the output root at a real
+ * Ownership rule (src/harness/ledger.ts): every board compiles into the same root, and the manifest
+ * keeps each board's agents and the files McBot wrote for them. A compile deletes only files its own
+ * board wrote before, never anything else, and it refuses to write into a profile folder another
+ * board's agent has now, or one McBot did not create — so pointing the output root at a real
  * ~/.hermes cannot clobber a hand-made profile.
  */
 import { createTwoFilesPatch } from "diff";
@@ -13,25 +14,40 @@ import {
   MANIFEST_PATH,
   type CompileReport,
   type CompileResult,
+  type CompiledFile,
   type FileChange,
   type Manifest,
 } from "../src/contracts/compile";
+import { renderManifest } from "../src/compile/manifest";
 import { sha256Hex, utf8Bytes } from "../src/compile/text";
+import { ownerOf, planWrite, toLedger, type Ledger } from "../src/harness/ledger";
 import { mergeConfig } from "../src/harness/merge";
 import { atomicWrite, readTextOrNull, resolveInside } from "./fsutil";
 
 export class OwnershipError extends Error {
   constructor(readonly profile: string, readonly dir: string) {
-    super(`profiles/${profile} already exists at ${dir} and was not created by McBot; refusing to overwrite it`);
+    super(`profiles/${profile} already exists at ${dir} and McBot did not make it; give the agent another id, or move that folder away`);
     this.name = "OwnershipError";
   }
 }
 
-export async function readManifest(root: string): Promise<Manifest | null> {
+/** Another board's agent has this id now (McBot gives a board's agent a free id before it compiles; see engine/server.ts). */
+export class NameTakenError extends Error {
+  constructor(readonly profile: string, readonly board: string) {
+    super(`${profile} is an agent on another board (${board}); give this one another id`);
+    this.name = "NameTakenError";
+  }
+}
+
+/**
+ * The manifest on disk, with every board's part (src/harness/ledger.ts). `known`: agents McBot
+ * compiled into this root before boards were kept apart, so their folders are McBot's again.
+ */
+export async function readManifest(root: string, known: Iterable<string> = []): Promise<Ledger | null> {
   const raw = await readTextOrNull(resolveInside(root, MANIFEST_PATH));
   if (raw === null) return null;
   const parsed = JSON.parse(raw) as Manifest;
-  return Array.isArray(parsed.files) && Array.isArray(parsed.profiles) ? parsed : null;
+  return Array.isArray(parsed.files) && Array.isArray(parsed.profiles) ? toLedger(parsed, known) : null;
 }
 
 async function isEmptyOrMissing(dir: string): Promise<boolean> {
@@ -43,6 +59,13 @@ async function isEmptyOrMissing(dir: string): Promise<boolean> {
   }
 }
 
+/** Profile folders under the root that have something in them. */
+export async function occupiedProfiles(root: string, names: Iterable<string>): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const n of new Set(names)) if (!(await isEmptyOrMissing(resolveInside(root, `profiles/${n}`)))) out.add(n);
+  return out;
+}
+
 function unifiedDiff(path: string, before: string, after: string): string {
   if (before === after) return "";
   return createTwoFilesPatch(`a/${path}`, `b/${path}`, before, after, "", "", { context: 3 });
@@ -51,29 +74,59 @@ function unifiedDiff(path: string, before: string, after: string): string {
 export interface WriteOptions {
   /** Compute the report without touching the disk. */
   dryRun?: boolean;
+  /** Does that board still have an agent with that id? (The engine asks the board; unknown = yes.) */
+  live?: (board: string, profile: string) => boolean | Promise<boolean>;
+  /** Agents McBot compiled into this root before boards were kept apart (see readManifest). */
+  known?: Iterable<string>;
 }
 
 export async function writeCompileResult(result: CompileResult, root: string, opts: WriteOptions = {}): Promise<CompileReport> {
-  const previous = await readManifest(root);
-  const owned = new Set(previous?.profiles ?? []);
-
-  for (const p of result.profiles) {
-    const dir = resolveInside(root, p.dir);
-    if (!owned.has(p.name) && !(await isEmptyOrMissing(dir))) throw new OwnershipError(p.name, dir);
-  }
-
-  const changes: FileChange[] = [];
-  const next = new Set(result.files.map((f) => f.path));
+  const known = [...(opts.known ?? [])];
+  const ledger = (await readManifest(root, known)) ?? toLedger(null, known);
 
   // config.yaml is merged into the one on disk: McBot changes only the keys the board shows and
   // keeps everything Hermes, the CLI or an agent added (src/harness/merge.ts).
-  const files = result.files.map((f) => ({ ...f }));
-  for (const f of files) {
+  const files: CompiledFile[] = [];
+  const befores = new Map<string, string | null>();
+  for (const compiled of result.files) {
+    if (compiled.role === "manifest") continue;
+    const f = { ...compiled };
     const before = await readTextOrNull(resolveInside(root, f.path));
+    befores.set(f.path, before);
     if (f.role === "config") {
       const merged = mergeConfig(before, f.content);
       if (merged !== f.content) Object.assign(f, { content: merged, sha256: sha256Hex(merged), bytes: utf8Bytes(merged).length });
     }
+    files.push(f);
+  }
+
+  // Which board owns which folder: this board's agents, and what it wrote before (src/harness/ledger.ts).
+  const names = result.profiles.map((p) => p.name);
+  const occupied = await occupiedProfiles(root, [...names, ...ledger.profiles, ...ledger.retired]);
+  const answers = new Map<string, boolean>();
+  for (const name of names) {
+    const owner = ownerOf(ledger, name);
+    if (owner && owner !== result.graphId) answers.set(`${owner}/${name}`, opts.live ? await opts.live(owner, name) : true);
+  }
+  const plan = planWrite({
+    ledger,
+    graphId: result.graphId,
+    profiles: names,
+    files: files.map((f) => ({ path: f.path, sha256: f.sha256, bytes: f.bytes })),
+    occupied,
+    live: (board, profile) => answers.get(`${board}/${profile}`) ?? true,
+  });
+  if (plan.refusal?.kind === "taken") throw new NameTakenError(plan.refusal.profile, plan.refusal.board);
+  if (plan.refusal) throw new OwnershipError(plan.refusal.profile, resolveInside(root, `profiles/${plan.refusal.profile}`));
+
+  // The manifest on disk holds every board's part, not only this board's.
+  const manifest = renderManifest(plan.ledger);
+  files.push({ path: MANIFEST_PATH, content: manifest, sha256: sha256Hex(manifest), bytes: utf8Bytes(manifest).length, role: "manifest" });
+  befores.set(MANIFEST_PATH, await readTextOrNull(resolveInside(root, MANIFEST_PATH)));
+
+  const changes: FileChange[] = [];
+  for (const f of files) {
+    const before = befores.get(f.path) ?? null;
     const prevSha = before === null ? null : sha256Hex(before);
     changes.push({
       path: f.path,
@@ -87,19 +140,18 @@ export async function writeCompileResult(result: CompileResult, root: string, op
     });
   }
 
-  for (const old of previous?.files ?? []) {
-    if (next.has(old.path)) continue;
-    const before = await readTextOrNull(resolveInside(root, old.path));
+  for (const path of plan.remove) {
+    const before = await readTextOrNull(resolveInside(root, path));
     if (before === null) continue;
     changes.push({
-      path: old.path,
+      path,
       status: "removed",
       sha256: null,
       previousSha256: sha256Hex(before),
       bytes: utf8Bytes(before).length,
       role: null,
       nodeId: null,
-      diff: unifiedDiff(old.path, before, ""),
+      diff: unifiedDiff(path, before, ""),
     });
   }
   changes.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));

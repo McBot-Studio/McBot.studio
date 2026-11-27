@@ -7,7 +7,7 @@
  *   HERMES_HOME=<root> hermes -p <agent> ...
  *
  *   <root>/
- *     .mcbot/manifest.json                 McBot-owned: every file below + sha256
+ *     .mcbot/manifest.json                 McBot-owned: every file below + sha256, per board
  *     profiles/<agent>/                    one Hermes profile per agent node
  *       SOUL.md                            identity (profile root, never cwd)
  *       config.yaml                        model / providers / fallback_providers / mcp_servers
@@ -62,11 +62,26 @@ export interface ManifestEntry {
   bytes: number;
 }
 
+/** One board's part of a root: the agents it compiled there and the files McBot wrote for them. */
+export interface BoardRecord {
+  profiles: string[];
+  files: ManifestEntry[];
+}
+
+/**
+ * compile() writes one board's manifest. Every board compiles into the same root, so the engine's
+ * writer keeps them all in the file on disk (src/harness/ledger.ts): `profiles` and `files` are then
+ * every board's, `graphId` the board compiled last, `boards` each board's own, and `retired` the
+ * profile folders McBot made whose agent left its board (Hermes' memory and sessions stay there, and
+ * an agent with that name may use the folder again).
+ */
 export interface Manifest {
   schema: typeof COMPILE_SCHEMA;
   graphId: string;
   profiles: string[];
   files: ManifestEntry[];
+  boards?: Record<string, BoardRecord>;
+  retired?: string[];
 }
 
 /** What the engine reports after writing a CompileResult to disk. */

@@ -36,6 +36,27 @@ describe("Ask McBot: quick plans", () => {
   });
 });
 
+describe("Ask McBot: building software", () => {
+  it("a dev team for apps gets the App studio and every role named, the project manager leading, never a sales agent", () => {
+    const { plan, add, resolved } = build("make a dev team that makes new apps , plugins, new features in mcbot app  that i can easilly access, like crm for my company, and apps. it needs dev, coder, designer, researcher, tester, verifier, agent that browse data, and ofc project manager that assign taks, making agents etc!");
+    expect(plan.agents.map((a) => a.name)).toEqual(["Project manager", "Researcher", "Designer", "Coder", "Tester", "Reviewer", "Data scout"]);
+    expect(plan.handoffs).toEqual(plan.agents.slice(1).map((a) => ["Project manager", a.name]));
+    expect(plan.agents[0]!.tools).toEqual([]);
+    expect(resolved.issues.filter((i) => i.level === "error")).toEqual([]);
+    const pm = resolved.bundles.find((b) => b.agent.id === add.lead)!;
+    expect(pm.agent.data.displayName).toBe("Project manager");
+    expect(pm.team).toHaveLength(6);
+    expect(resolved.bundles.find((b) => b.agent.data.displayName === "Designer")!.image).toBeTruthy();
+  });
+
+  it("roles named outright are the team; a CRM to build is not a sales job", () => {
+    expect(quickPlan("I need a coder and a tester").agents.map((a) => a.name)).toEqual(["Coder", "Tester"]);
+    expect(quickPlan("a project manager, a designer and a researcher").agents.map((a) => a.name)).toEqual(["Project manager", "Researcher", "Designer"]);
+    expect(quickPlan("build a CRM for my company").agents.map((a) => a.name)).not.toContain("Sales Assistant");
+    expect(quickPlan("a team that finds leads for our CRM").agents.map((a) => a.name)).toContain("Sales Assistant");
+  });
+});
+
 describe("Ask McBot: a model's plan", () => {
   it("keeps only known ids and hand-offs between its own agents", () => {
     const text = '<think>hm</think>```json\n{"summary":"s","agents":[{"name":"Lead","tools":["exa","made-up"],"chatApps":["slack","myspace"],"skills":["official/research/qmd","official/nope"]},{"name":"Helper"}],"handoffs":[["Lead","Helper"],["Lead","Ghost"]]}\n```';

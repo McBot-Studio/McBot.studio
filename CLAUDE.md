@@ -83,6 +83,15 @@ Change them additively; a breaking change bumps the version.
   nothing else, and refuses to write into a profile dir it did not create. Inside
   config.yaml it owns only the keys in `OWNED` (`src/harness/merge.ts`); when compile
   writes a new key, add it there too (a test fails otherwise).
+- **Many boards, one root** (`src/harness/ledger.ts`, pure; the writer and the demo plan with it): the manifest on
+  disk keeps each board's agents and files (`boards`; `profiles`/`files` are every board's, `graphId` the last
+  compiled). A compile removes only its own board's earlier files. A profile dir is one board's at a time: an agent
+  whose id another board's live agent, or a dir McBot did not make, already has gets a free id before it compiles
+  (`claimNames`, "writer-2": the board is edited on a real compile, a dry run only shows it); a board that no longer
+  has the agent gives the dir up. A removed agent's dir stays McBot's (`retired`), so the id can come back to it with
+  Hermes' memory. A manifest from before (one board) is read with `hermes-seen.json`'s names as McBot's. Board-scoped
+  routes (team, memory, cost, Files, runs) use `profilesOf` / `ownerOf`, never the union; a run checks its agent's
+  dir is this board's.
   Hermes writes `state.db`, `sessions/`, `memories/`, logs and seeded skills into
   the same dirs.
 
@@ -442,7 +451,7 @@ Change them additively; a breaking change bumps the version.
   skills (`learnTeamSkills`) and fits the board. The board's own model plans it when it can (`POST /api/builder/plan`,
   host only, `engine/builder.ts`: the first agent's model, else the first model block, on its OpenAI-compatible
   `/chat/completions`, the key read in the engine; hard rule 4), given only the app's catalog ids (`PLAN_CHOICES`);
-  otherwise (no model, a teammate's window, the demo, a failed answer) `quickPlan` makes it from the words. Every plan
+  otherwise (no model, a teammate's window, the demo, a failed answer) `quickPlan` makes it from the words (the reason on hover of "Quick plan"): roles the request names are the team, a request to build software (an app, a plugin, a CRM) gets the App studio members, else roles by topic; a project manager, or a Lead for three or more, comes first and hands work to the rest. Both planners: up to 8 agents, every named role in, the first is the one you talk to. Every plan
   is cut to known ids twice (`restrictPlan` in the engine and in `planToBoard`). Nothing changes until accepted.
 - **Layers** (second mode of the board, `graph/LayersView.tsx`, pure `graph/layers.ts`): one agent's harness outside in,
   grouped like Settings: Surfaces (McBot chat, chat apps), Loop (steps per message, hand-offs, helpers, schedules),
@@ -580,7 +589,7 @@ Change them additively; a breaking change bumps the version.
   on macOS it stays a black rectangle (transparency needs a private API).
 - **New agent** (`shell/NewAgentSheet.tsx`): 19 one-click starting cards in five groups (`agentSuggestions.ts`) fill
   name, purpose and soul, and name the Hermes library skills they start with; after the first compile those install
-  one by one (`learnSkills` in `actions.ts`, `POST /api/skills/install`, host only). Starter teams (`graph/teams.ts`, 10)
+  one by one (`learnSkills` in `actions.ts`, `POST /api/skills/install`, host only). Starter teams (`graph/teams.ts`, 13; **App studio** builds apps: a project manager, the one you talk to, hands work to a researcher, designer, coder, tester, reviewer and data scout; **Council**: a chair gives one question to three advisors, best each on its own model, and weighs them; **Front desk** (`front`): one Assistant, profile `front-desk`, that hands work to every agent no one hands work to (`entryAgents`), and every team or Ask McBot plan added later is wired to the board's front desk (`frontDeskOf`, `joinFrontDesk`); setup adds it when it builds two teams or more and opens on it. Chat shows "Works alone · Ask <lead>" for an agent that hands work to no one but is handed work, `leadOf`: the top of its hand-offs)
   carry skills per member the same way, with one notice per team. Members and cards also bring their **tools** (catalog
   ids, e.g. web search) and **makers** (image, video), wired to them, so a designer makes the images itself and a
   researcher searches the web: agents do the work, not only describe it (owner's ask). A maker uses the service whose

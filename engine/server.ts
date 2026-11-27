@@ -7,7 +7,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { ChildProcess } from "node:child_process";
 import type { AddressInfo } from "node:net";
@@ -32,7 +32,7 @@ import { atomicWrite } from "./fsutil";
 import { FILE_MAX_BYTES, FolderError, Folders, browseFolders } from "./folders";
 import { bundledSource, bundledUpstream, findHermes, gatewayStatus, hermesCommand, hermesEnv, prepareHermes, setupHome, stopGateway } from "./hermes";
 import { DOC_MAX_BYTES, docKind, docText, extractWithHermes, freePath, hermesDirOf, safeDocName, saveDoc } from "./knowledge";
-import { MemoryConflict, readMemory, readSessions, readTaskWork, writeMemory } from "./hermesData";
+import { MemoryConflict, emptyMemory, readMemory, readSessions, readTaskWork, writeMemory } from "./hermesData";
 import { JOB_ID_RE, createScheduleArgv, readSchedules, scheduleActionArgv } from "./schedules";
 import { SEED_ARGV, SKILL_ID_RE, SKILL_NAME_RE, addSkillArgv, bundledSeeded, installArgv, installedSkills, listLibrary, parseSkillSearch, profileSkills, searchSkillsArgv, skillSources, uninstallArgv, updateArgv } from "./skills";
 import { PLUGIN_NAME_RE, disablePluginArgv, enablePluginArgv, installPluginArgv, listPluginCatalog, listPluginsArgv, parsePluginList, removePluginArgv } from "./plugins";
@@ -46,7 +46,9 @@ import { RunStore } from "./runStore";
 import type { RunEvent } from "../src/contracts/run";
 import { SecretError, Secrets } from "./secrets";
 import { SetupStore, detectLocal, listModels } from "./setup";
-import { OwnershipError, readManifest, writeCompileResult } from "./writer";
+import { NameTakenError, OwnershipError, occupiedProfiles, readManifest, writeCompileResult } from "./writer";
+import { claimNames, ownerOf, profilesOf, toLedger, type Ledger, type NameClaim } from "../src/harness/ledger";
+import { applyToDoc } from "../src/harness/live";
 import { Sharing, cleanOwnUrl, guestAllowed, joinPage, type Member, type SharingView } from "./sharing";
 import { Tunnel, launchQuickTunnel } from "./tunnel";
 import { LoginError, Logins } from "./logins";
@@ -234,6 +236,29 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
   };
 
   const bundlesOf = async (boardId: string) => resolveGraph(await relay.graph(boardId));
+  /** Every board's agents in this root and the files McBot wrote for them (src/harness/ledger.ts). */
+  const ledger = (): Promise<Ledger | null> => readManifest(cfg.hermesHome);
+  const agentNames = (g: Graph) => g.nodes.filter((n) => n.kind === "agent").map((n) => ({ id: n.id, name: String((n.data as { name?: unknown }).name ?? "") }));
+  /** Does that board still have an agent with that id? */
+  const boardHas = async (board: string, profile: string) =>
+    (await relay.exists(board)) && agentNames(await relay.graph(board)).some((a) => a.name === profile);
+  /** This board's agents that another board's agent, or a folder McBot did not make, keeps from their id. */
+  const nameClaims = async (boardId: string, graph: Graph, known: readonly string[]): Promise<NameClaim[]> => {
+    const agents = agentNames(graph);
+    const book = (await readManifest(cfg.hermesHome, known)) ?? toLedger(null, known);
+    const mcbots = new Set([...book.profiles, ...book.retired]);
+    const foreign = new Set([...(await occupiedProfiles(cfg.hermesHome, agents.map((a) => a.name)))].filter((n) => !mcbots.has(n)));
+    const live = new Map<string, boolean>();
+    for (const a of agents) {
+      const owner = ownerOf(book, a.name);
+      if (owner && owner !== boardId) live.set(`${owner}/${a.name}`, await boardHas(owner, a.name));
+    }
+    if (!foreign.size && ![...live.values()].some(Boolean)) return [];
+    // Every id in use anywhere, so the new one is free on every board and on disk.
+    const taken = new Set([...mcbots, ...agents.map((a) => a.name), ...(await readdir(join(cfg.hermesHome, "profiles")).catch(() => [] as string[]))]);
+    for (const b of await relay.list()) if (b.id !== boardId) for (const a of agentNames(await relay.graph(b.id))) taken.add(a.name);
+    return claimNames({ agents, boardId, ledger: book, live: (b, p) => live.get(`${b}/${p}`) ?? true, foreign, taken });
+  };
   /** Whose McBot this is, as people who join see it. */
   const hostName = async () => (await setup.get()).profile?.name?.trim() || "A teammate";
   /** The agents a guest (Can chat) may talk to: the ones their link named, on their board. */
@@ -251,8 +276,9 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
 
   /** This board's compiled agents: profile name → node id (who can be given a task). */
   const teamOf = async (boardId: string): Promise<Map<string, string>> => {
-    const [{ bundles }, manifest] = await Promise.all([bundlesOf(boardId), readManifest(cfg.hermesHome)]);
-    return new Map(bundles.filter((b) => manifest?.profiles.includes(b.agent.data.name)).map((b) => [b.agent.data.name, b.agent.id]));
+    const [{ bundles }, book] = await Promise.all([bundlesOf(boardId), ledger()]);
+    const mine = new Set(profilesOf(book, boardId));
+    return new Map(bundles.filter((b) => mine.has(b.agent.data.name)).map((b) => [b.agent.data.name, b.agent.id]));
   };
   /** `hermes kanban …` on this root's board; a failure becomes Hermes' own words, as a 409. */
   const kanban = async (argv: string[], stdin = ""): Promise<string> => {
@@ -286,28 +312,32 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
   const person = z.string().trim().min(1).max(64);
 
   /**
-   * After a compile, a saved key and at start: fill every compiled agent's .env from the board
-   * compiled into this root, and keep the gateway up while any agent has a chat app whose bot
-   * token is saved (a bot must answer without a run in progress). Serialized; never throws.
+   * After a compile, a saved key and at start: fill every compiled agent's .env from the board that
+   * compiled it (every board compiles into this root), and keep the gateway up while any agent has a
+   * chat app whose bot token is saved (a bot must answer without a run in progress). Serialized;
+   * never throws.
    */
   let syncing: Promise<void> = Promise.resolve();
   const syncAgents = (): Promise<void> => (syncing = syncing.then(async () => {
-    const manifest = await readManifest(cfg.hermesHome);
-    if (!manifest || !BOARD_ID_RE.test(manifest.graphId) || !(await relay.exists(manifest.graphId))) return;
-    const { bundles } = await bundlesOf(manifest.graphId);
+    const book = await ledger();
+    if (!book) return;
     const saved = await secrets.env();
     let live = false;
-    for (const b of bundles) {
-      if (!manifest.profiles.includes(b.agent.data.name)) continue;
-      await writeProfileKeys(join(cfg.hermesHome, "profiles", b.agent.data.name), { ...resolveEntries(envEntriesFor(b), saved), ...(gateway ? apiEnv(gateway) : {}) });
-      live ||= hasLiveChannel(b, saved);
-      // A schedule fires only while a gateway serves its agent (cron/jobs.py, per-profile stores).
-      live ||= (await readSchedules(cfg.hermesHome, b.agent.data.name)).some((j) => j.enabled);
+    for (const [boardId, rec] of Object.entries(book.boards)) {
+      if (!BOARD_ID_RE.test(boardId) || !(await relay.exists(boardId))) continue;
+      const { bundles } = await bundlesOf(boardId);
+      for (const b of bundles) {
+        if (!rec.profiles.includes(b.agent.data.name)) continue;
+        await writeProfileKeys(join(cfg.hermesHome, "profiles", b.agent.data.name), { ...resolveEntries(envEntriesFor(b), saved), ...(gateway ? apiEnv(gateway) : {}) });
+        live ||= hasLiveChannel(b, saved);
+        // A schedule fires only while a gateway serves its agent (cron/jobs.py, per-profile stores).
+        live ||= (await readSchedules(cfg.hermesHome, b.agent.data.name)).some((j) => j.enabled);
+      }
     }
     if (live) console.log(`[engine] chat apps and schedules: gateway ${await runner.ensureGateway()}`);
   }).catch((err: unknown) => console.error("[engine] could not update agents' keys:", err)));
   onBoardSaved = (boardId) => {
-    void readManifest(cfg.hermesHome).then((m) => { if (m?.graphId === boardId) void syncAgents(); }).catch(() => undefined);
+    void ledger().then((m) => { if (profilesOf(m, boardId).length) void syncAgents(); }).catch(() => undefined);
   };
 
   const routes: Record<string, (req: IncomingMessage, url: URL) => Promise<unknown>> = {
@@ -490,21 +520,34 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
       }
       const boardId = await requireBoard(body.boardId);
       const { bundles, issues } = await bundlesOf(boardId);
-      const bundle = bundles.find((b) => b.agent.id === body.agentNodeId);
+      let bundle = bundles.find((b) => b.agent.id === body.agentNodeId);
       if (!bundle) throw new HttpError(404, "no such agent on this board");
       const agentName = bundle.agent.data.displayName || bundle.agent.data.name;
       let drift = await compileBoard(boardId, true);
-      if (!drift.ok) throw new HttpError(409, who?.role === "chat" ? `${agentName} isn't ready right now. Ask ${await hostName()} to check it.` : "The board has errors; fix them before running.", who?.role === "chat" ? {} : { issues });
-      const dir = `profiles/${bundle.agent.data.name}/`;
-      let stale = drift.report.changes.filter((c) => c.path.startsWith(dir) && c.status !== "unchanged");
+      if (!drift.ok) throw new HttpError(409, who?.role === "chat" ? `${agentName} isn't ready right now. Ask ${await hostName()} to check it.` : drift.issues.some((i) => i.level === "error") ? "The board has errors; fix them before running." : drift.error, who?.role === "chat" ? {} : { issues });
+      /**
+       * What differs on disk from what a compile would write for this agent. A compile may first give
+       * it a free id (another board's agent has its id, src/harness/ledger.ts): then all of it.
+       */
+      const staleOf = (d: CompileResponse, b: AgentBundle): string[] => {
+        if (!d.ok) return [];
+        const as = d.report.profiles.find((p) => p.nodeId === b.agent.id)?.name ?? b.agent.data.name;
+        const paths = d.report.changes.filter((c) => c.path.startsWith(`profiles/${as}/`) && c.status !== "unchanged").map((c) => c.path);
+        return as === b.agent.data.name ? paths : [`profiles/${as}/`, ...paths];
+      };
+      let stale = staleOf(drift, bundle);
       // A guest can't compile: their question uses the board as it is now, as the host's would.
       if (stale.length && who?.role === "chat") {
         const done = await compileBoard(boardId, false);
         if (!done.ok) throw new HttpError(409, `${agentName} isn't ready right now. Ask ${await hostName()} to check it.`);
+        bundle = (await bundlesOf(boardId)).bundles.find((b) => b.agent.id === body.agentNodeId);
+        if (!bundle) throw new HttpError(404, "no such agent on this board");
         drift = await compileBoard(boardId, true);
-        stale = drift.ok ? drift.report.changes.filter((c) => c.path.startsWith(dir) && c.status !== "unchanged") : stale;
+        stale = drift.ok ? staleOf(drift, bundle) : stale;
       }
-      if (stale.length) throw new HttpError(409, `The board changed since ${bundle.agent.data.name} was last compiled. Compile, then run.`, { stale: stale.map((c) => c.path) });
+      // Its folder must be this board's, never another board's agent with the same id.
+      if (!stale.length && ownerOf(await ledger(), bundle.agent.data.name) !== boardId) stale = [`profiles/${bundle.agent.data.name}/`];
+      if (stale.length) throw new HttpError(409, `The board changed since ${bundle.agent.data.name} was last compiled. Compile, then run.`, { stale });
       if (!(await findHermes())) throw new HttpError(503, "The engine is not set up yet");
       // A daily budget stops the runs McBot starts once today's (UTC) spend reaches it.
       const limit = bundle.agent.data.dailyBudgetUsd ?? 0;
@@ -857,16 +900,21 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
     "GET /api/memory": async (_req, url): Promise<AgentMemoryView[]> => {
       const boardId = await requireBoard(url.searchParams.get("boardId"));
       const { bundles } = await bundlesOf(boardId);
-      const manifest = await readManifest(cfg.hermesHome);
-      return Promise.all(bundles.map(async ({ agent }) => ({
-        profile: agent.data.name,
-        nodeId: agent.id,
-        displayName: agent.data.displayName || agent.data.name,
-        compiled: !!manifest?.profiles.includes(agent.data.name),
-        busy: runner.isBusy(agent.data.name),
-        memory: await readMemory(cfg.hermesHome, agent.data.name, "memory"),
-        user: await readMemory(cfg.hermesHome, agent.data.name, "user"),
-      })));
+      const book = await ledger();
+      return Promise.all(bundles.map(async ({ agent }) => {
+        const owner = ownerOf(book, agent.data.name);
+        // Another board's agent with the same id: its memory is not this one's.
+        const read = (target: "memory" | "user") => (owner && owner !== boardId ? emptyMemory(agent.data.name, target) : readMemory(cfg.hermesHome, agent.data.name, target));
+        return {
+          profile: agent.data.name,
+          nodeId: agent.id,
+          displayName: agent.data.displayName || agent.data.name,
+          compiled: owner === boardId,
+          busy: runner.isBusy(agent.data.name),
+          memory: await read("memory"),
+          user: await read("user"),
+        };
+      }));
     },
     "PUT /api/memory": async (req) => {
       const body = parse(z.object({
@@ -886,9 +934,9 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
     "GET /api/cost": async (_req, url) => {
       const boardId = await requireBoard(url.searchParams.get("boardId"));
       const { bundles } = await bundlesOf(boardId);
-      const manifest = await readManifest(cfg.hermesHome);
+      const mine = new Set(profilesOf(await ledger(), boardId));
       const profiles = bundles
-        .filter((b) => manifest?.profiles.includes(b.agent.data.name))
+        .filter((b) => mine.has(b.agent.data.name))
         .map((b) => ({ profile: b.agent.data.name, agentNodeId: b.agent.id, sessions: readSessions(cfg.hermesHome, b.agent.data.name), dailyBudgetUsd: b.agent.data.dailyBudgetUsd ?? null }));
       return buildCostReport(profiles, await store.list(boardId), modelsOf(bundles));
     },
@@ -988,9 +1036,9 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
     "GET /api/fs/roots": async (_req, url): Promise<FsRoot[]> => {
       const boardId = await requireBoard(url.searchParams.get("boardId"));
       const { bundles } = await bundlesOf(boardId);
-      const manifest = await readManifest(cfg.hermesHome);
+      const mine = new Set(profilesOf(await ledger(), boardId));
       const profiles: FsRoot[] = bundles
-        .filter((b) => manifest?.profiles.includes(b.agent.data.name))
+        .filter((b) => mine.has(b.agent.data.name))
         .map((b) => ({ id: `profile:${b.agent.data.name}`, kind: "profile", name: b.agent.data.displayName || b.agent.data.name, path: join(cfg.hermesHome, "profiles", b.agent.data.name), nodeId: b.agent.id }));
       const shared: FsRoot = { id: "workspace:files", kind: "workspace", name: "Shared files", path: join(cfg.workspace, "files") };
       return [...profiles, shared, ...(await folders.opened())];
@@ -1034,8 +1082,9 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
       const saved = await folders.write(body.root, dir, body.path, body.text, body.baseSha256);
       // An agent's settings: the board follows at once (the watcher would within seconds).
       const profile = /^profile:(.+)$/.exec(body.root)?.[1];
-      if (profile && manifest && !saved.path.startsWith("workspace/") && (await relay.exists(manifest.graphId))) {
-        const change = await hermesSync.follow(manifest.graphId, profile).catch(() => null);
+      const owner = profile ? ownerOf(manifest, profile) : null;
+      if (profile && owner && !saved.path.startsWith("workspace/") && (await relay.exists(owner))) {
+        const change = await hermesSync.follow(owner, profile).catch(() => null);
         return { ...saved, followed: change?.changed ?? [] };
       }
       return saved;
@@ -1121,12 +1170,33 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
     if (after.length !== before.length || after.at(-1)?.id !== before.at(-1)?.id) await writeVersions(boardId, after);
   }
 
-  async function compileBoard(boardId: string, dryRun: boolean): Promise<CompileResponse> {
-    const graph = await relay.graph(boardId);
+  /** Compiles that write, one at a time: two boards claiming ids at once would pick the same free one. */
+  let writing: Promise<unknown> = Promise.resolve();
+  function compileBoard(boardId: string, dryRun: boolean): Promise<CompileResponse> {
+    if (dryRun) return compileOnce(boardId, true);
+    const next = writing.then(() => compileOnce(boardId, false));
+    writing = next.catch(() => undefined);
+    return next;
+  }
+
+  async function compileOnce(boardId: string, dryRun: boolean): Promise<CompileResponse> {
+    let graph = await relay.graph(boardId);
     const { issues } = resolveGraph(graph);
     if (issues.some((i) => i.level === "error")) return { ok: false, issues, error: "The board has errors" };
+    const known = await hermesSync.known();
+    // Every board compiles into one root: an agent whose id another board's agent (or a folder McBot
+    // did not make) has gets a free one first (src/harness/ledger.ts). A dry run shows what Compile will do.
+    const claims = await nameClaims(boardId, graph, known);
+    if (claims.length && dryRun) {
+      const to = new Map(claims.map((c) => [c.id, c.to]));
+      graph = { ...graph, nodes: graph.nodes.map((n) => (to.has(n.id) ? { ...n, data: { ...n.data, name: to.get(n.id)! } } : n)) } as Graph;
+    } else if (claims.length) {
+      applyToDoc((await relay.room(boardId)).doc, claims.map((c) => ({ op: "set" as const, id: c.id, field: "name", value: c.to })));
+      graph = await relay.graph(boardId);
+      for (const c of claims) console.log(`[engine] ${boardId}: agent ${c.from} is now ${c.to} (another board or folder has ${c.from})`);
+    }
     try {
-      const report = await writeCompileResult(compile(graph), cfg.hermesHome, { dryRun });
+      const report = await writeCompileResult(compile(graph), cfg.hermesHome, { dryRun, known, live: boardHas });
       const configChanged = report.changes.some((c) => c.path.endsWith("/config.yaml") && c.status !== "unchanged");
       if (!dryRun && configChanged) runner.markGatewayStale();
       if (!dryRun) await atomicWrite(join(cfg.workspace, "compiles", `${boardId}.json`), `${JSON.stringify({ at: Date.now(), report }, null, 2)}\n`);
@@ -1137,6 +1207,10 @@ export async function startEngine(cfg: EngineConfig): Promise<Engine> {
       return { ok: true, report, issues, gateway: !dryRun && configChanged && cfg.managedRoot ? "restart-pending" : "unchanged" };
     } catch (err) {
       if (err instanceof OwnershipError) return { ok: false, issues, error: err.message };
+      if (err instanceof NameTakenError) {
+        const other = (await relay.list()).find((b) => b.id === err.board)?.name ?? err.board;
+        return { ok: false, issues, error: `${err.profile} is an agent on the board "${other}" too; compile again to give this one its own id` };
+      }
       throw err;
     }
   }

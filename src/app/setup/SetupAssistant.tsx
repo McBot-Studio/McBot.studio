@@ -218,15 +218,14 @@ export function SetupAssistant({ onDone }: { onDone: (boardId: string | null, ag
           const written = res.report.changes.filter((c) => c.status !== "unchanged").length;
           set(2, { status: "ok", detail: `${written} files` });
           set(3, { status: "busy" });
+          // The ids the agents compiled as: one another board's agent has gets a free one (src/harness/ledger.ts).
+          const as = new Map(res.report.profiles.map((p) => [p.nodeId, p.name]));
           const fact = userFacts(profile);
-          if (fact) {
-            const agents = graph.nodes.filter((n) => n.kind === "agent").map((n) => (n.data as { name: string }).name);
-            await Promise.all(agents.map((a) => engine.saveMemory(a, "user", [fact], null).catch(() => null)));
-          }
+          if (fact) await Promise.all(res.report.profiles.map((p) => engine.saveMemory(p.name, "user", [fact], null).catch(() => null)));
           await pause(350);
           set(3, { status: "ok", detail: graph.brief ? "in every SOUL.md" : fact ? "USER.md" : undefined });
           // Their Hermes skills install in the background, one agent after another (notices say how it went).
-          if (skills.length && !REMOTE) void learnTeamSkills("Your team", skills);
+          if (skills.length && !REMOTE) void learnTeamSkills("Your team", skills.map((x) => ({ profile: (x.nodeId && as.get(x.nodeId)) || x.profile, who: x.who, ids: x.ids })));
         }
       }
       await engine.setupComplete(profile);
