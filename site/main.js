@@ -485,6 +485,12 @@ document.documentElement.classList.add("js");
         m.classList.toggle("near", Math.hypot(dx, dy) < 90);
       }
     }, { passive: true });
+    // Under the pointer the light runs faster from where it is (a new duration would make it jump).
+    const flow = (m) => (m.getAnimations ? m.getAnimations({ subtree: true }) : []).filter((a) => a.animationName === "metal-spin");
+    for (const m of metals) {
+      m.addEventListener("pointerenter", () => flow(m).forEach((a) => a.updatePlaybackRate?.(2.8)));
+      m.addEventListener("pointerleave", () => flow(m).forEach((a) => a.updatePlaybackRate?.(1)));
+    }
   }
 
   /* ---------- the split download button ---------- */
@@ -647,4 +653,285 @@ document.documentElement.classList.add("js");
     }
   }
   cursors.forEach((c, i) => void run(c, i));
+})();
+
+/* ---------- You and McBot: a ring shows the page sees your cursor, and McBot's own cursor follows a
+   beat behind, says hello now and then and, once a visit, flies to GitHub and brings you a star to
+   give. Desktop with a mouse only; elsewhere, and with reduced motion, the star is a quiet note. The
+   star count shows beside GitHub once there are enough stars to show. ---------- */
+(() => {
+  const REPO = "McBot-Studio/mcbot.studio";
+  const REPO_URL = `https://github.com/${REPO}`;
+  const KEY = "mcbot.star";
+  const DAY = 864e5;
+  const $ = (s, r = document) => r.querySelector(s);
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const STAR = '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true"><path d="M12 2.6l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.4l-5.8 3.1 1.1-6.5L2.6 9.4l6.5-.9z"/></svg>';
+
+  /* what this visitor said before: "done" (starred), or "later:<time>" (ask again after it) */
+  const store = {
+    get() { try { return localStorage.getItem(KEY) || ""; } catch { return ""; } },
+    set(v) { try { localStorage.setItem(KEY, v); } catch { /* a private window: ask once per visit */ } },
+  };
+  const askable = () => {
+    const v = store.get();
+    if (v === "done") return false;
+    return !v.startsWith("later:") || Date.now() > Number(v.slice(6));
+  };
+  const later = (days) => { if (store.get() !== "done") store.set(`later:${Date.now() + days * DAY}`); };
+  // Whoever opens the repository has seen its star button: no reminder for a week.
+  document.addEventListener("click", (e) => {
+    const a = e.target.closest?.("a[href]");
+    if (a && a.href.startsWith(REPO_URL) && !a.hasAttribute("data-star-go") && !a.href.includes("/releases/download/")) later(7);
+  });
+
+  /* the star count beside "GitHub" */
+  const SHOW_FROM = 50;
+  const showStars = (n) => {
+    if (!(n >= SHOW_FROM)) return;
+    const t = n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/\.0$/, "")}k` : String(n);
+    document.querySelectorAll("[data-stars]").forEach((el) => { const b = el.querySelector("b"); if (b) b.textContent = t; el.hidden = false; });
+  };
+  let cached = null;
+  try { cached = JSON.parse(sessionStorage.getItem("mcbot.stars") || "null"); } catch { cached = null; }
+  if (cached && Date.now() - cached.at < 36e5) showStars(cached.n);
+  else {
+    fetch(`https://api.github.com/repos/${REPO}`, { headers: { Accept: "application/vnd.github+json" } })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!d || typeof d.stargazers_count !== "number") return;
+        showStars(d.stargazers_count);
+        try { sessionStorage.setItem("mcbot.stars", JSON.stringify({ n: d.stargazers_count, at: Date.now() })); } catch { /* fine */ }
+      })
+      .catch(() => { /* offline: no count */ });
+  }
+
+  /* the star card: brought by McBot on a desktop, a quiet note at the bottom elsewhere */
+  const card = document.createElement("aside");
+  card.className = "star-card";
+  card.setAttribute("aria-label", "Star McBot Studio on GitHub");
+  card.hidden = true;
+  card.innerHTML = `<span class="st-star">${STAR}</span><span class="st-t"><b>Enjoying McBot Studio?</b><small>A star on GitHub helps other people find it.</small></span><span class="st-btns"><a class="btn sm light" href="${REPO_URL}" target="_blank" rel="noopener" data-star-go>${STAR}Star on GitHub</a><button class="btn sm ghost" type="button" data-star-later>Not now</button></span>`;
+  document.body.appendChild(card);
+  let onAnswer = () => {};
+  const hideCard = () => {
+    card.classList.toggle("on", false);
+    setTimeout(() => { if (!card.classList.contains("on")) card.hidden = true; }, 260);
+  };
+  const showCard = () => {
+    card.hidden = false;
+    requestAnimationFrame(() => requestAnimationFrame(() => card.classList.toggle("on", true)));
+  };
+  $("[data-star-go]", card).addEventListener("click", () => { store.set("done"); hideCard(); onAnswer("thanks"); });
+  $("[data-star-later]", card).addEventListener("click", () => { later(7); hideCard(); onAnswer("later"); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !card.hidden) { later(7); hideCard(); onAnswer("later"); } });
+
+  // When is someone ready to be asked? A while on the page and a good look around.
+  const born = performance.now();
+  let seenTo = 0;
+  const measure = () => { seenTo = Math.max(seenTo, (scrollY + innerHeight) / Math.max(1, document.documentElement.scrollHeight)); };
+  addEventListener("scroll", measure, { passive: true });
+  measure();
+  const lookedAround = (ms, share) => performance.now() - born > ms && seenTo > share && !document.hidden;
+
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const mouse = matchMedia("(hover: hover) and (pointer: fine) and (min-width: 900px)").matches;
+  if (reduce || !mouse) {
+    const iv = setInterval(() => {
+      if (!askable()) { clearInterval(iv); return; }
+      if (!lookedAround(40000, 0.45)) return;
+      clearInterval(iv);
+      card.classList.toggle("toast", true);
+      showCard();
+    }, 2000);
+    return;
+  }
+
+  /* ----- the ring and McBot's cursor ----- */
+  const layer = document.createElement("div");
+  layer.className = "buddy-layer";
+  layer.setAttribute("aria-hidden", "true");
+  layer.innerHTML = `<div class="you-ring"></div><div class="buddy"><div class="buddy-in"><svg class="arrow" width="20" height="22" viewBox="0 0 20 22"><path d="M2 1.5 17.5 11l-7 1.4-3.6 6.6z" fill="#f5f5f7" stroke="#0b0b0c" stroke-width="1.6" stroke-linejoin="round"/></svg><span class="ping"></span><span class="carry">${STAR}</span><span class="tag"><img src="assets/logo.svg" width="17" height="17" alt="">McBot</span><span class="say"></span></div></div>`;
+  document.body.appendChild(layer);
+  const ring = $(".you-ring", layer);
+  const buddy = $(".buddy", layer);
+  const bubble = $(".say", layer);
+
+  const S = { px: 0, py: 0, has: false, movedAt: -1e9, rx: 0, ry: 0, bx: 0, by: 0, vx: 0, tilt: 0, mode: "follow", fly: null };
+  let raf = 0;
+  let last = 0;
+  const frame = (t) => {
+    const dt = clamp((t - last) / 1000, 0.001, 0.05);
+    last = t;
+    // The ring hugs the cursor; McBot follows a beat behind, a little below and to the right.
+    const kr = 1 - Math.exp(-dt * 28);
+    S.rx += (S.px - S.rx) * kr;
+    S.ry += (S.py - S.ry) * kr;
+    let busy = Math.abs(S.px - S.rx) + Math.abs(S.py - S.ry) > 0.2;
+    const ox = S.bx;
+    if (S.fly) { S.fly(t); busy = true; }
+    else if (S.mode === "follow") {
+      const kb = 1 - Math.exp(-dt * 3.2);
+      const tx = S.px + 26, ty = S.py + 24;
+      S.bx += (tx - S.bx) * kb;
+      S.by += (ty - S.by) * kb;
+      busy ||= Math.abs(tx - S.bx) + Math.abs(ty - S.by) > 0.3;
+    }
+    S.vx = (S.bx - ox) / dt;
+    // It leans into the way it moves.
+    const lean = clamp(S.vx * 0.012, -12, 12);
+    S.tilt += (lean - S.tilt) * (1 - Math.exp(-dt * 9));
+    busy ||= Math.abs(S.tilt) > 0.05;
+    ring.style.transform = `translate3d(${S.rx.toFixed(1)}px, ${S.ry.toFixed(1)}px, 0)`;
+    buddy.style.transform = `translate3d(${S.bx.toFixed(1)}px, ${S.by.toFixed(1)}px, 0) rotate(${S.tilt.toFixed(2)}deg)`;
+    raf = busy ? requestAnimationFrame(frame) : 0;
+  };
+  const kick = () => { if (!raf) { last = performance.now(); raf = requestAnimationFrame(frame); } };
+
+  /** Flies McBot to a target (a function, so it can follow something that moves) along a curve. */
+  const fly = (to, ms) => new Promise((done) => {
+    const from = { x: S.bx, y: S.by };
+    const end = to();
+    const c = { x: (from.x + end.x) / 2 + (end.y - from.y) * 0.28, y: (from.y + end.y) / 2 - (end.x - from.x) * 0.28 };
+    const t0 = performance.now();
+    S.fly = (t) => {
+      const k = clamp((t - t0) / ms, 0, 1);
+      const e = k < 0.5 ? 4 * k * k * k : 1 - (-2 * k + 2) ** 3 / 2;
+      const T = to();
+      S.bx = (1 - e) * (1 - e) * from.x + 2 * (1 - e) * e * c.x + e * e * T.x;
+      S.by = (1 - e) * (1 - e) * from.y + 2 * (1 - e) * e * c.y + e * e * T.y;
+      if (k >= 1) { S.fly = null; done(); }
+    };
+    kick();
+  });
+
+  /* what McBot says: each line once, never two close together */
+  const said = new Set();
+  let quietUntil = 0;
+  let sayTimer = 0;
+  const say = (key, text, ms = 2400, force = false) => {
+    const now = performance.now();
+    if (!force && (said.has(key) || now < quietUntil || S.mode !== "follow")) return;
+    said.add(key);
+    quietUntil = now + ms + 5000;
+    bubble.textContent = text;
+    buddy.classList.toggle("saying", true);
+    clearTimeout(sayTimer);
+    sayTimer = setTimeout(() => buddy.classList.toggle("saying", false), ms);
+  };
+  const LINES = [
+    ["[data-bot]", "bot", "That's me, in glass."],
+    ["[data-dl-primary], .os .btn, .closing a[href='#download']", "dl", "Good choice."],
+    ["[data-demo]", "demo", "Try me right here."],
+    ["[data-gh]", "gh", "A star helps a lot."],
+    ["[data-crew]", "crew", "My friends."],
+  ];
+
+  addEventListener("pointermove", (e) => {
+    if (e.pointerType !== "mouse") return;
+    S.px = e.clientX;
+    S.py = e.clientY;
+    S.movedAt = performance.now();
+    if (!S.has) {
+      S.has = true;
+      S.rx = S.px; S.ry = S.py;
+      // McBot drops in from the top of the window to meet you.
+      S.bx = clamp(S.px + 160, 40, innerWidth - 40);
+      S.by = -40;
+      layer.classList.toggle("on", true);
+      setTimeout(() => say("hi", "Hi, I'm McBot. I'll tag along.", 2800), 900);
+    }
+    layer.classList.toggle("away", false);
+    kick();
+  }, { passive: true });
+  document.addEventListener("mouseout", (e) => { if (!e.relatedTarget) layer.classList.toggle("away", true); });
+  addEventListener("blur", () => layer.classList.toggle("away", true));
+  addEventListener("pointerdown", (e) => { if (e.pointerType === "mouse") ring.classList.toggle("down", true); });
+  addEventListener("pointerup", () => ring.classList.toggle("down", false));
+  document.addEventListener("pointerover", (e) => {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    ring.classList.toggle("over", !!t.closest("a, button, summary, [role='button'], [data-bot], .star-card"));
+    // Over a menu McBot steps back, so it never covers what you are choosing.
+    buddy.classList.toggle("shy", !!t.closest(".drop, .split-menu, .nav-menu, .star-card"));
+    for (const [sel, key, text] of LINES) if (t.closest(sel)) { say(key, text); break; }
+  });
+
+  /* ----- the star: McBot flies to the GitHub button, takes a star and brings it to you ----- */
+  const gh = $(".nav-end [data-gh]");
+  const ghSpot = () => { const r = gh.getBoundingClientRect(); return { x: r.left + r.width * 0.55, y: r.top + r.height * 0.6 }; };
+  const ghShown = () => !!gh && gh.getBoundingClientRect().width > 0;
+  const press = () => { buddy.classList.toggle("click", false); void buddy.offsetWidth; buddy.classList.toggle("click", true); };
+  let idle = 0;
+  // Close to you, with room for the card below McBot.
+  const nearYou = () => {
+    const w = card.offsetWidth || 340, h = card.offsetHeight || 130;
+    return { x: clamp(S.px + 30, 16, innerWidth - w - 16), y: clamp(S.py + 26, 80, innerHeight - h - 76) };
+  };
+  const placeCard = () => {
+    const w = card.offsetWidth, h = card.offsetHeight;
+    card.style.left = `${clamp(S.bx + 2, 16, innerWidth - w - 16)}px`;
+    card.style.top = `${clamp(S.by + 54, 16, innerHeight - h - 16)}px`;
+  };
+  const putBack = async () => {
+    if (card.hidden || S.mode !== "park") return;
+    later(2);
+    hideCard();
+    S.mode = "busy";
+    buddy.classList.toggle("parked", false);
+    if (ghShown()) {
+      await fly(ghSpot, 900);
+      press();
+      buddy.classList.toggle("carrying", false);
+      gh.classList.toggle("starred", true);
+      await wait(350);
+    } else buddy.classList.toggle("carrying", false);
+    S.mode = "follow";
+    kick();
+  };
+  onAnswer = (kind) => {
+    clearTimeout(idle);
+    buddy.classList.toggle("parked", false);
+    buddy.classList.toggle("carrying", false);
+    if (kind === "thanks") gh?.classList.toggle("starred", true);
+    S.mode = "follow";
+    kick();
+    say(kind, kind === "thanks" ? "Thank you! That means a lot." : "No worries.", 2400, true);
+  };
+  card.addEventListener("pointerenter", () => clearTimeout(idle));
+  card.addEventListener("pointerleave", () => { clearTimeout(idle); idle = setTimeout(putBack, 9000); });
+
+  const deliver = async () => {
+    S.mode = "busy";
+    if (ghShown()) {
+      say("fetch", "Wait, I've got something for you.", 1500, true);
+      await wait(1100);
+      await fly(ghSpot, 950);
+      gh.classList.toggle("gh-pick", true);
+      press();
+      await wait(320);
+      buddy.classList.toggle("carrying", true);
+      await wait(480);
+      gh.classList.toggle("gh-pick", false);
+    } else {
+      buddy.classList.toggle("carrying", true);
+    }
+    await fly(nearYou, 1000);
+    S.mode = "park";
+    buddy.classList.toggle("parked", true);
+    card.hidden = false;
+    placeCard();
+    showCard();
+    idle = setTimeout(putBack, 16000);
+  };
+  const iv = setInterval(() => {
+    if (!askable()) { clearInterval(iv); return; }
+    const ready = lookedAround(35000, 0.4) && S.has && S.mode === "follow" && !S.fly
+      && performance.now() - S.movedAt < 4000 && !layer.classList.contains("away")
+      && !document.querySelector(".nav-item.open, .nav.open, .split-menu:not([hidden])");
+    if (!ready) return;
+    clearInterval(iv);
+    void deliver();
+  }, 1500);
 })();

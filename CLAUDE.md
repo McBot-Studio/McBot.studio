@@ -730,11 +730,25 @@ MCBOT_E2E=1 npm test   also run the real end-to-end test on McBot's own Hermes
   or trade dress). Owner's rule: no gradients, glows, dotted grids or status dots, no gray boxes behind brand logos,
   and no scroll-jacking, with one exception the owner asked for: the **liquid metal** ring around the Download
   buttons (`.metal`, a chrome conic gradient through the `#liquid` SVG turbulence filter, flowing, brighter and faster
-  under the pointer; the button inside is dark metal). The menu bar is a full-width bar (`.nav-bar`: Product and
+  under the pointer; the button inside is dark metal). The light turns by animating the gradient's angle (`--spin`,
+  keyframes `metal-spin`), never by rotating the element: a turning rectangle left the ring's ends uncovered and the
+  button looked cut (keyframe names are global, so never reuse `spin`). Its darkest tone stays a mid grey, so no part
+  of the ring disappears into the black page; the split's two halves meet with square corners over a dark fill; under
+  the pointer it speeds up with `updatePlaybackRate` (a new `animation-duration` makes it jump). The menu bar is a
+  full-width bar (`.nav-bar`: Product and
   Resources menus that open on hover or click, Compare, FAQ, News; GitHub and Download on the right; a burger
   under 1000 px). **AI cursors** (end of `site/main.js`): three of the team (Researcher, Writer, Designer, each with its
   bot) walk to real hero elements and select, hover, click or leave a note, only while the hero is on screen, never
-  on phones or with reduced motion. The footer opens with the **crew**: eight big bots (196 px) cut off by its top
+  on phones or with reduced motion. **You and McBot** (last in `site/main.js`, desktop with a mouse, never with reduced
+  motion): a thin ring around the visitor's cursor (larger over anything clickable, smaller on a press) and McBot's
+  own cursor (white arrow, the burger on its tag) following a beat behind, with a few lines said once each; over a
+  menu it steps back. Once a visit, after 35 s and 40% of the page, it flies to the nav's GitHub button, takes a star
+  and parks a card beside you (Star on GitHub, Not now; Esc is Not now). `mcbot.star` in localStorage remembers it:
+  `done` once starred, `later:<time>` for 7 days after Not now or a visit to the repository; left alone 16 s, McBot puts
+  the star back on the button and waits 2 days. Without a mouse, or with reduced motion, the same card is a quiet
+  note at the bottom after 40 s and 45%. The star count shows beside GitHub only from 50 stars. **Links** to other
+  sites and the demo open in a new tab (`target="_blank" rel="noopener"`); in-page anchors and installer downloads
+  stay in the tab. The footer opens with the **crew**: eight big bots (196 px) cut off by its top
   line, rising and smiling when touched. The copy
   sells three reasons in plain words (no filler, no placeholder company names): yours (on your
   computer, private, never locked in), any model ("Switch models, not apps") and the harness you
@@ -742,7 +756,9 @@ MCBOT_E2E=1 npm test   also run the real end-to-end test on McBot's own Hermes
   and downloads. The live views (`site/main.js`, `site/style.css`: the hero window is the app as it
   opens, with its frameless window, rail and a chat that uses a tool, answers and asks before
   acting, so keep it in step with the app; then the model switch, the harness compiling, a task
-  that runs until done, a question, documents, training, an approval, the ⌘K palette and the terminal) play only while on screen, hold their final state
+  that runs until done, a question, documents, training, an approval, the ⌘K palette, the terminal, and in Built in
+  the Files view with a file dropped in, the browser, harness versions, a rich answer and a download checked with
+  `gh attestation verify`) play only while on screen, hold their final state
   under `prefers-reduced-motion`, and use the page's flat colours; they are markup, not
   screenshots. Page anatomy (as the product pages we compare with do it): a split Download button
   (your OS, plus a menu) under the headline; moving rows of brand marks, each on its own colour
