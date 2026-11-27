@@ -39,6 +39,8 @@ export function BuilderSheet() {
   const [busy, setBusy] = useState(false);
   const [plan, setPlan] = useState<HarnessPlan | null>(null);
   const [by, setBy] = useState("");
+  /** Why the plan was made here from the words, not by the board's model (shown on hover). */
+  const [why, setWhy] = useState("");
   const asked = useRef(0);
   const close = () => setBuilder(false);
 
@@ -62,17 +64,19 @@ export function BuilderSheet() {
     setRequest(text);
     setBusy(true);
     const mine = ++asked.current;
-    let result: { plan: HarnessPlan; by: string };
+    let result: { plan: HarnessPlan; by: string; why?: string };
     try {
       // The board's own model plans it; a teammate's window, the demo, or a model that can't, plan here.
-      if (REMOTE || models.length === 0) throw new Error("no model");
+      if (REMOTE) throw new Error("Only the host's window asks the board's model");
+      if (models.length === 0) throw new Error("No model on this board yet: add one to have it plan");
       result = await engine.builderPlan(boardId, text, PLAN_CHOICES);
-    } catch {
-      result = { plan: quickPlan(text), by: "" };
+    } catch (err) {
+      result = { plan: quickPlan(text), by: "", why: `Made from your words. ${(err as Error).message}` };
     }
     if (mine !== asked.current) return;
     setPlan(result.plan);
     setBy(result.by);
+    setWhy(result.why ?? "");
     setBusy(false);
   };
 
@@ -105,7 +109,7 @@ export function BuilderSheet() {
           <span className="hermes-mark" aria-hidden><Logo size={22} /></span>
           <div className="grow">
             <h2>{plan ? "Here's a harness" : "Ask McBot to build it"}</h2>
-            <small>{plan ? (by ? `Designed by ${by}` : "Quick plan") + " · nothing changes until you add it" : "Describe the agents you need"}</small>
+            <small data-tip={plan && !by ? why || undefined : undefined}>{plan ? (by ? `Designed by ${by}` : "Quick plan") + " · nothing changes until you add it" : "Describe the agents you need"}</small>
           </div>
           <button className="icon-btn" aria-label="Close" onClick={close}><X size={15} /></button>
         </header>

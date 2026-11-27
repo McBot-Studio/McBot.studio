@@ -78,6 +78,20 @@ export const TEAMS: readonly StarterTeam[] = [
     handoffs: [["tech-lead", "coder"], ["tech-lead", "reviewer"]],
   },
   {
+    // The one to talk to is the project manager: it splits the work and hands every piece out.
+    id: "studio", label: "App studio", does: "A project manager you talk to; a team researches, designs, builds, tests and checks your apps",
+    members: [
+      { name: "pm", displayName: "Project manager", description: "Your one contact: plans the work and hands it out.", soul: "You are the one I talk to. Turn each request into a short plan and hand every piece to the right teammate as a task that says what done looks like; do not build it yourself.\nOrder the work: research, design, build, test, then check. Send work back to the coder when the tester or reviewer finds problems.\nAnswer with what was done, how to open it, and what is left. Ask me before anything goes public or costs money." },
+      { name: "researcher", displayName: "Researcher", description: "Finds how others solve it and what to build with.", soul: "You research before anything is built: similar products, libraries, APIs and their limits.\nShort bullets with links, then recommend one option.", skills: ["official/research/parallel-cli"], tools: ["exa"] },
+      { name: "designer", displayName: "Designer", description: "Designs the screens, flows and icons.", soul: "You design each app's screens, flows and icon: a mockup first, flat and readable, then what the coder needs (sizes, colours, states).\nMake the images yourself with your image tool.", skills: ["official/creative/impeccable", "official/creative/design-md"], makers: ["image"] },
+      { name: "coder", displayName: "Coder", description: "Builds the apps and features.", soul: "You build what the task asks for in small, working steps: a web app that runs on this computer unless told otherwise, started with one command and explained in a README.\nWhen it serves a page, give its address (http://127.0.0.1:<port>) so it opens in McBot's Browser. Say what you changed and how to try it.", skills: ["official/software-development/ast-grep", "official/software-development/node-inspect-debugger"], tools: ["context7"] },
+      { name: "tester", displayName: "Tester", description: "Tests every change like a user would.", soul: "You test each change: run it, use it like a real user, try to break it, and add tests where they help.\nReport each failure with exact steps to reproduce; say plainly when it passes.", skills: ["official/dogfood/adversarial-ux-test", "official/software-development/rest-graphql-debug"], tools: ["browser"] },
+      { name: "reviewer", displayName: "Reviewer", description: "Checks the work against what was asked.", soul: "You check finished work against the task: every requirement met, the code safe and readable.\nBe specific: file, line, what to change. End with done or not done.", skills: ["official/software-development/ast-grep", "official/software-development/grill-me"] },
+      { name: "data-scout", displayName: "Data scout", description: "Browses sites and gathers the data apps need.", soul: "You collect the data an app needs from the web and from files: browse, extract, clean, and save it as CSV or JSON with where each piece came from.\nRespect each site's terms; never sign in anywhere without my OK.", skills: ["official/research/scrapling"], tools: ["browser", "exa"] },
+    ],
+    handoffs: [["pm", "researcher"], ["pm", "designer"], ["pm", "coder"], ["pm", "tester"], ["pm", "reviewer"], ["pm", "data-scout"]],
+  },
+  {
     id: "content", label: "Content studio", does: "An editor plans posts; a writer drafts; a designer makes the images",
     members: [
       { name: "editor", displayName: "Editor", description: "Plans the content calendar.", soul: "You plan content: topics, angles and dates.\nHand drafts to the writer and image ideas to the designer, then check both.", skills: ["official/creative/social-media-content-calendar"] },

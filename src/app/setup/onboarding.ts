@@ -17,7 +17,7 @@ export const GOALS: { id: string; label: string; sub: string; team: string }[] =
   { id: "support", label: "Customer support", sub: "Answer and route questions", team: "support" },
   { id: "research", label: "Research & reports", sub: "Sources, summaries, write-ups", team: "research" },
   { id: "launch", label: "Launch something", sub: "Page, posts and a video", team: "launch" },
-  { id: "dev", label: "Software", sub: "Plan, code and review", team: "dev" },
+  { id: "dev", label: "Apps & software", sub: "Build, test and check apps", team: "studio" },
   { id: "markets", label: "Markets & finance", sub: "Watch, model, brief", team: "markets" },
   { id: "knowledge", label: "A knowledge base", sub: "A wiki that stays up to date", team: "knowledge" },
   { id: "personal", label: "Everyday help", sub: "Plan days, draft mail, look things up", team: "personal" },

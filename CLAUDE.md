@@ -451,7 +451,7 @@ Change them additively; a breaking change bumps the version.
   skills (`learnTeamSkills`) and fits the board. The board's own model plans it when it can (`POST /api/builder/plan`,
   host only, `engine/builder.ts`: the first agent's model, else the first model block, on its OpenAI-compatible
   `/chat/completions`, the key read in the engine; hard rule 4), given only the app's catalog ids (`PLAN_CHOICES`);
-  otherwise (no model, a teammate's window, the demo, a failed answer) `quickPlan` makes it from the words. Every plan
+  otherwise (no model, a teammate's window, the demo, a failed answer) `quickPlan` makes it from the words (the reason on hover of "Quick plan"): roles the request names are the team, a request to build software (an app, a plugin, a CRM) gets the App studio members, else roles by topic; a project manager, or a Lead for three or more, comes first and hands work to the rest. Both planners: up to 8 agents, every named role in, the first is the one you talk to. Every plan
   is cut to known ids twice (`restrictPlan` in the engine and in `planToBoard`). Nothing changes until accepted.
 - **Layers** (second mode of the board, `graph/LayersView.tsx`, pure `graph/layers.ts`): one agent's harness outside in,
   grouped like Settings: Surfaces (McBot chat, chat apps), Loop (steps per message, hand-offs, helpers, schedules),
@@ -589,7 +589,7 @@ Change them additively; a breaking change bumps the version.
   on macOS it stays a black rectangle (transparency needs a private API).
 - **New agent** (`shell/NewAgentSheet.tsx`): 19 one-click starting cards in five groups (`agentSuggestions.ts`) fill
   name, purpose and soul, and name the Hermes library skills they start with; after the first compile those install
-  one by one (`learnSkills` in `actions.ts`, `POST /api/skills/install`, host only). Starter teams (`graph/teams.ts`, 10)
+  one by one (`learnSkills` in `actions.ts`, `POST /api/skills/install`, host only). Starter teams (`graph/teams.ts`, 11; **App studio** builds apps: a project manager, the one you talk to, hands work to a researcher, designer, coder, tester, reviewer and data scout)
   carry skills per member the same way, with one notice per team. Members and cards also bring their **tools** (catalog
   ids, e.g. web search) and **makers** (image, video), wired to them, so a designer makes the images itself and a
   researcher searches the web: agents do the work, not only describe it (owner's ask). A maker uses the service whose
