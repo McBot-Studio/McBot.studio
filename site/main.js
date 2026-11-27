@@ -565,7 +565,8 @@ document.documentElement.classList.add("js");
 })();
 
 /* ---------- AI cursors: three of the team at work on the hero, as on the app's shared board. Each
-   walks to a real element, selects, hovers, clicks or leaves a note, then moves on. Desktop only,
+   walks to a real element, selects, hovers, clicks or leaves a note, then moves on; the Writer types
+   the headline. Desktop only,
    only while the hero is on screen; reduced motion shows none. ---------- */
 (() => {
   const layer = document.querySelector("[data-ai]");
@@ -583,7 +584,7 @@ document.documentElement.classList.add("js");
   // What each one does, over and over: [target, action, words]
   const PLANS = [
     [[".hero-title", "select", "Reading the headline"], [".hero-win .w-thread", "note", "Found 3 sources"], ["[data-demo]", "hover", "Trying the demo"], [".hero-meta", "note", "Checked: free, MIT"]],
-    [[".hero-lede", "select", "Drafting a reply…"], [".hero-win .w-compose", "click", "Typing in chat"], [".hero-title", "note", "Shorter? Keeping it."]],
+    [[".hero-title", "write", "Writing the headline"], [".hero-win .w-compose", "click", "Typing in chat"], [".hero-lede", "select", "Drafting a reply…"]],
     [["[data-dl-primary]", "hover", "Polishing the button"], ["[data-dl-primary]", "click", ""], [".bot", "note", "Logo looks great"], [".hero-win .win-bar", "select", "Aligning the window"]],
   ];
   const cursors = TEAM.map((m, i) => {
@@ -623,6 +624,56 @@ document.documentElement.classList.add("js");
     await sleep(ms);
     c.el.classList.toggle("saying", false);
   };
+  /* The Writer types the headline: it selects it, clears it and writes it again letter by letter,
+     its caret in its colour and its cursor riding the caret. Letters not typed yet are only hidden,
+     so nothing on the page moves; afterwards the headline's own markup comes back as it was. */
+  const title = q(".hero-title");
+  const headline = title ? title.innerHTML : "";
+  const spoken = title ? [...title.childNodes].map((n) => (n.nodeName === "BR" ? " " : n.textContent)).join("").replace(/\s+/g, " ").trim() : "";
+  async function write(c, t, text) {
+    t.dataset.aiBusy = "1";
+    void say(c, text, 2600);
+    t.classList.toggle("ai-sel", true);
+    await sleep(750);
+    t.classList.toggle("ai-sel", false);
+    const letters = [];
+    const typed = document.createDocumentFragment();
+    for (const n of [...t.childNodes]) {
+      if (n.nodeType !== 3) { typed.appendChild(n.cloneNode(true)); continue; }
+      for (const ch of n.textContent) {
+        const l = document.createElement("span");
+        l.className = "ai-l";
+        l.textContent = ch;
+        letters.push(l);
+        typed.appendChild(l);
+      }
+    }
+    const caret = document.createElement("span");
+    caret.className = "ai-caret";
+    typed.insertBefore(caret, typed.firstChild);
+    t.setAttribute("aria-label", spoken);
+    t.replaceChildren(typed);
+    const ride = () => {
+      const r = caret.getBoundingClientRect(), s = stage.getBoundingClientRect();
+      c.el.style.setProperty("--t", "0.16s");
+      c.el.style.setProperty("--x", `${r.left - s.left + 6}px`);
+      c.el.style.setProperty("--y", `${r.top - s.top + r.height * 0.78}px`);
+      c.x = r.left - s.left + 6; c.y = r.top - s.top + r.height * 0.78;
+    };
+    ride();
+    await sleep(380);
+    for (const l of letters) {
+      l.className = "";
+      l.after(caret);
+      ride();
+      await sleep((l.textContent === " " ? 120 : 45) + Math.random() * 70);
+    }
+    caret.classList.toggle("rest", true);
+    await sleep(1100);
+    t.innerHTML = headline;
+    t.removeAttribute("aria-label");
+    delete t.dataset.aiBusy;
+  }
   async function run(c, i) {
     const s = stage.getBoundingClientRect();
     c.x = i % 2 ? s.width + 40 : -40;
@@ -635,10 +686,13 @@ document.documentElement.classList.add("js");
       if (!live || document.hidden || narrow.matches) { await sleep(800); continue; }
       const [sel, act, text] = c.plan[n % c.plan.length];
       const p = at(sel);
-      if (!p) { await sleep(600); continue; }
+      if (!p || p.t.dataset.aiBusy) { await sleep(600); continue; }
       await move(c, p.x, p.y);
+      // Someone else may have started on it while this one walked over.
+      if (p.t.dataset.aiBusy) { await sleep(600); continue; }
       p.t.style.setProperty("--c", TEAM[i].c);
-      if (act === "select" || act === "hover") {
+      if (act === "write") await write(c, p.t, text);
+      else if (act === "select" || act === "hover") {
         const cls = act === "select" ? "ai-sel" : "ai-hover";
         p.t.classList.toggle(cls, true);
         await say(c, text, act === "select" ? 1700 : 1200);
@@ -655,9 +709,8 @@ document.documentElement.classList.add("js");
   cursors.forEach((c, i) => void run(c, i));
 })();
 
-/* ---------- You and McBot: a ring shows the page sees your cursor, and McBot's own cursor follows a
-   beat behind, says hello now and then and, once a visit, flies to GitHub and brings you a star to
-   give. Desktop with a mouse only; elsewhere, and with reduced motion, the star is a quiet note. The
+/* ---------- You and McBot: McBot's own cursor follows yours a beat behind, says hello now and then
+   and, five seconds in, flies to GitHub and brings you a star to give (once a visit). Desktop with a mouse only; elsewhere, and with reduced motion, the star is a quiet note. The
    star count shows beside GitHub once there are enough stars to show. ---------- */
 (() => {
   const REPO = "McBot-Studio/mcbot.studio";
@@ -740,7 +793,7 @@ document.documentElement.classList.add("js");
   if (reduce || !mouse) {
     const iv = setInterval(() => {
       if (!askable()) { clearInterval(iv); return; }
-      if (!lookedAround(40000, 0.45)) return;
+      if (!lookedAround(10000, 0)) return;
       clearInterval(iv);
       card.classList.toggle("toast", true);
       showCard();
@@ -748,27 +801,23 @@ document.documentElement.classList.add("js");
     return;
   }
 
-  /* ----- the ring and McBot's cursor ----- */
+  /* ----- McBot's cursor ----- */
   const layer = document.createElement("div");
   layer.className = "buddy-layer";
   layer.setAttribute("aria-hidden", "true");
-  layer.innerHTML = `<div class="you-ring"></div><div class="buddy"><div class="buddy-in"><svg class="arrow" width="20" height="22" viewBox="0 0 20 22"><path d="M2 1.5 17.5 11l-7 1.4-3.6 6.6z" fill="#f5f5f7" stroke="#0b0b0c" stroke-width="1.6" stroke-linejoin="round"/></svg><span class="ping"></span><span class="carry">${STAR}</span><span class="tag"><img src="assets/logo.svg" width="17" height="17" alt="">McBot</span><span class="say"></span></div></div>`;
+  layer.innerHTML = `<div class="buddy"><div class="buddy-in"><svg class="arrow" width="20" height="22" viewBox="0 0 20 22"><path d="M2 1.5 17.5 11l-7 1.4-3.6 6.6z" fill="#f5f5f7" stroke="#0b0b0c" stroke-width="1.6" stroke-linejoin="round"/></svg><span class="ping"></span><span class="carry">${STAR}</span><span class="tag"><img src="assets/logo.svg" width="17" height="17" alt="">McBot</span><span class="say"></span></div></div>`;
   document.body.appendChild(layer);
-  const ring = $(".you-ring", layer);
   const buddy = $(".buddy", layer);
   const bubble = $(".say", layer);
 
-  const S = { px: 0, py: 0, has: false, movedAt: -1e9, rx: 0, ry: 0, bx: 0, by: 0, vx: 0, tilt: 0, mode: "follow", fly: null };
+  const S = { px: 0, py: 0, has: false, movedAt: -1e9, bx: 0, by: 0, vx: 0, tilt: 0, mode: "follow", fly: null };
   let raf = 0;
   let last = 0;
   const frame = (t) => {
     const dt = clamp((t - last) / 1000, 0.001, 0.05);
     last = t;
-    // The ring hugs the cursor; McBot follows a beat behind, a little below and to the right.
-    const kr = 1 - Math.exp(-dt * 28);
-    S.rx += (S.px - S.rx) * kr;
-    S.ry += (S.py - S.ry) * kr;
-    let busy = Math.abs(S.px - S.rx) + Math.abs(S.py - S.ry) > 0.2;
+    // McBot follows a beat behind, a little below and to the right.
+    let busy = false;
     const ox = S.bx;
     if (S.fly) { S.fly(t); busy = true; }
     else if (S.mode === "follow") {
@@ -783,7 +832,6 @@ document.documentElement.classList.add("js");
     const lean = clamp(S.vx * 0.012, -12, 12);
     S.tilt += (lean - S.tilt) * (1 - Math.exp(-dt * 9));
     busy ||= Math.abs(S.tilt) > 0.05;
-    ring.style.transform = `translate3d(${S.rx.toFixed(1)}px, ${S.ry.toFixed(1)}px, 0)`;
     buddy.style.transform = `translate3d(${S.bx.toFixed(1)}px, ${S.by.toFixed(1)}px, 0) rotate(${S.tilt.toFixed(2)}deg)`;
     raf = busy ? requestAnimationFrame(frame) : 0;
   };
@@ -835,7 +883,6 @@ document.documentElement.classList.add("js");
     S.movedAt = performance.now();
     if (!S.has) {
       S.has = true;
-      S.rx = S.px; S.ry = S.py;
       // McBot drops in from the top of the window to meet you.
       S.bx = clamp(S.px + 160, 40, innerWidth - 40);
       S.by = -40;
@@ -847,12 +894,9 @@ document.documentElement.classList.add("js");
   }, { passive: true });
   document.addEventListener("mouseout", (e) => { if (!e.relatedTarget) layer.classList.toggle("away", true); });
   addEventListener("blur", () => layer.classList.toggle("away", true));
-  addEventListener("pointerdown", (e) => { if (e.pointerType === "mouse") ring.classList.toggle("down", true); });
-  addEventListener("pointerup", () => ring.classList.toggle("down", false));
   document.addEventListener("pointerover", (e) => {
     const t = e.target;
     if (!(t instanceof Element)) return;
-    ring.classList.toggle("over", !!t.closest("a, button, summary, [role='button'], [data-bot], .star-card"));
     // Over a menu McBot steps back, so it never covers what you are choosing.
     buddy.classList.toggle("shy", !!t.closest(".drop, .split-menu, .nav-menu, .star-card"));
     for (const [sel, key, text] of LINES) if (t.closest(sel)) { say(key, text); break; }
@@ -927,7 +971,7 @@ document.documentElement.classList.add("js");
   };
   const iv = setInterval(() => {
     if (!askable()) { clearInterval(iv); return; }
-    const ready = lookedAround(35000, 0.4) && S.has && S.mode === "follow" && !S.fly
+    const ready = lookedAround(5000, 0) && S.has && S.mode === "follow" && !S.fly
       && performance.now() - S.movedAt < 4000 && !layer.classList.contains("away")
       && !document.querySelector(".nav-item.open, .nav.open, .split-menu:not([hidden])");
     if (!ready) return;

@@ -739,14 +739,15 @@ MCBOT_E2E=1 npm test   also run the real end-to-end test on McBot's own Hermes
   Resources menus that open on hover or click, Compare, FAQ, News; GitHub and Download on the right; a burger
   under 1000 px). **AI cursors** (end of `site/main.js`): three of the team (Researcher, Writer, Designer, each with its
   bot) walk to real hero elements and select, hover, click or leave a note, only while the hero is on screen, never
-  on phones or with reduced motion. **You and McBot** (last in `site/main.js`, desktop with a mouse, never with reduced
-  motion): a thin ring around the visitor's cursor (larger over anything clickable, smaller on a press) and McBot's
-  own cursor (white arrow, the burger on its tag) following a beat behind, with a few lines said once each; over a
-  menu it steps back. Once a visit, after 35 s and 40% of the page, it flies to the nav's GitHub button, takes a star
+  on phones or with reduced motion; the Writer types the headline, letter by letter with a caret in its colour (letters
+  not typed yet are only hidden, so nothing moves; the headline's own markup comes back after). **You and McBot** (last in `site/main.js`, desktop with a mouse, never with reduced
+  motion): McBot's own cursor (white arrow, the burger on its tag) following the visitor's a beat behind, with a few
+  lines said once each; over a menu it steps back. No ring or other mark around the visitor's own cursor (the owner
+  found it annoying). Once a visit, 5 s in, it flies to the nav's GitHub button, takes a star
   and parks a card beside you (Star on GitHub, Not now; Esc is Not now). `mcbot.star` in localStorage remembers it:
   `done` once starred, `later:<time>` for 7 days after Not now or a visit to the repository; left alone 16 s, McBot puts
   the star back on the button and waits 2 days. Without a mouse, or with reduced motion, the same card is a quiet
-  note at the bottom after 40 s and 45%. The star count shows beside GitHub only from 50 stars. **Links** to other
+  note at the bottom after 10 s. The star count shows beside GitHub only from 50 stars. **Links** to other
   sites and the demo open in a new tab (`target="_blank" rel="noopener"`); in-page anchors and installer downloads
   stay in the tab. The footer opens with the **crew**: eight big bots (196 px) cut off by its top
   line, rising and smiling when touched. The copy
