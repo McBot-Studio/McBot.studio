@@ -2152,7 +2152,7 @@ dependencies = [
 
 [[package]]
 name = "mcbot"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "base64 0.23.1",
  "portable-pty",
